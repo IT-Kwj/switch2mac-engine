@@ -73,12 +73,6 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                     context.AddCapability(Capability.Geometry);
                 }
 
-                // nxnative: the sample index (PIXLD.MYINDEX) is a SampleRateShading input
-                if (context.Info.IoDefinitions.Contains(new IoDefinition(StorageKind.Input, IoVariable.SampleId)))
-                {
-                    context.AddCapability(Capability.SampleRateShading);
-                }
-
                 if (context.HostCapabilities.SupportsFragmentShaderInterlock)
                 {
                     context.AddCapability(Capability.FragmentShaderPixelInterlockEXT);
@@ -153,6 +147,11 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                 Generate(context, info, funcIndex);
             }
 
+            if (context.Properties.Mesh != null)
+            {
+                GenerateMeshEntry(context, context.Properties.Mesh);
+            }
+
             byte[] result = context.Generate();
 
             lock (_poolLock)
@@ -162,6 +161,240 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             }
 
             return result;
+        }
+
+        // nxnative: the entry point of a Switch 2 task / mesh program (StructuredIr/MeshShaderInfo.cs). The translated program is function 0, run as a compute body: its
+        // early returns stay legal. The wrapper calls it, waits for the workgroup, then hands the stage memory over the way SPV_EXT_mesh_shader wants it:
+        //   task: the payload word 0 cleared (the base address a mesh workgroup reads first), EmitMeshTasksEXT(word 1 = mesh groups to launch, 1, 1, payload)
+        //   mesh: SetMeshOutputsEXT(MaxVertices, primitive count = byte 3), then every vertex's planes into the outputs (position, generic attributes at their
+        //         locations) and every triangle's three index bytes (4 + 3 t) into PrimitiveTriangleIndicesEXT, each workgroup thread taking every threads-th one
+        private static void GenerateMeshEntry(CodeGenContext context, MeshShaderInfo mesh)
+        {
+            context.AddCapability(Capability.MeshShadingEXT);
+            context.AddExtension("SPV_EXT_mesh_shader");
+
+            SpvInstruction tVoid = context.TypeVoid(), tU32 = context.TypeU32(), tF32 = context.TypeFP32(), tBool = context.TypeBool();
+            SpvInstruction tVec4 = context.TypeVector(tF32, 4), tUVec3 = context.TypeVector(tU32, 3);
+            SpvInstruction U(uint v) => context.Constant(tU32, v);
+            int threads = Math.Max(1, context.Definitions.ComputeLocalSizeX * context.Definitions.ComputeLocalSizeY * context.Definitions.ComputeLocalSizeZ);
+            List<SpvInstruction> io = new(context.GetMainInterface());
+
+            SpvInstruction lidVar = context.Variable(context.TypePointer(StorageClass.Input, tU32), StorageClass.Input);
+            context.Decorate(lidVar, Decoration.BuiltIn, (SpvLiteralInteger)BuiltIn.LocalInvocationIndex);
+            context.AddGlobalVariable(lidVar);
+            io.Add(lidVar);
+
+            SpvInstruction payload = context.SharedMemories[mesh.PayloadMemoryId];
+            io.Add(payload);
+
+            // Mesh outputs: the position (in a per-vertex block), one vec4 array per generic attribute the planes name, the triangles
+            SpvInstruction posVar = null, idxVar = null;
+            Dictionary<int, SpvInstruction> generics = new(), primGenerics = new();
+            if (mesh.IsMesh)
+            {
+                SpvInstruction perVertex = context.TypeStruct(true, tVec4);
+                context.Decorate(perVertex, Decoration.Block);
+                context.MemberDecorate(perVertex, 0, Decoration.BuiltIn, (SpvLiteralInteger)BuiltIn.Position);
+                posVar = context.Variable(context.TypePointer(StorageClass.Output, context.TypeArray(perVertex, U((uint)mesh.MaxVertices))), StorageClass.Output);
+                context.AddGlobalVariable(posVar);
+                io.Add(posVar);
+
+                // Per-primitive outputs (the paired pixel shader's flat inputs, MeshShaderInfo.PrimitivePlanes): one vec4 array per generic location, one element per primitive
+                foreach (int plane in mesh.PrimitivePlanes)
+                {
+                    int g = (plane - 4) >> 2;
+                    if (plane < 4 || primGenerics.ContainsKey(g))
+                    {
+                        continue;
+                    }
+
+                    SpvInstruction v = context.Variable(context.TypePointer(StorageClass.Output, context.TypeArray(tVec4, U((uint)mesh.MaxPrimitives))), StorageClass.Output);
+                    context.Decorate(v, Decoration.Location, (SpvLiteralInteger)g);
+                    context.Decorate(v, Decoration.PerPrimitiveEXT);
+                    context.AddGlobalVariable(v);
+                    primGenerics[g] = v;
+                    io.Add(v);
+                }
+
+                // Every other generic location 0-5 gets a per-vertex output (the highest a mesh-paired pixel shader reads is g5; 0-7 overflowed Metal's 32 KB mesh output limit on
+                // b9edd9c570bd32dd): Metal refuses (or its compiler service dies on) a mesh pipeline whose fragment inputs the mesh does not provide. Unwritten ones hold (0, 0, 0, 1)
+                // as dmsh_build.py vs_pad gives a vertex shader's (put there by dmsh_build.py ms_pad)
+                for (int plane = 4; plane < 4 + 6 * 4; plane += 4)
+                {
+                    int g = (plane - 4) >> 2;
+                    if (generics.ContainsKey(g) || primGenerics.ContainsKey(g))
+                    {
+                        continue;
+                    }
+
+                    SpvInstruction v = context.Variable(context.TypePointer(StorageClass.Output, context.TypeArray(tVec4, U((uint)mesh.MaxVertices))), StorageClass.Output);
+                    context.Decorate(v, Decoration.Location, (SpvLiteralInteger)g);
+                    context.AddGlobalVariable(v);
+                    generics[g] = v;
+                    io.Add(v);
+                }
+
+                idxVar = context.Variable(context.TypePointer(StorageClass.Output, context.TypeArray(tUVec3, U((uint)mesh.MaxPrimitives))), StorageClass.Output);
+                context.Decorate(idxVar, Decoration.BuiltIn, (SpvLiteralInteger)BuiltIn.PrimitiveTriangleIndicesEXT);
+                context.AddGlobalVariable(idxVar);
+                io.Add(idxVar);
+            }
+
+            (_, SpvInstruction body) = context.GetFunction(0);
+            SpvInstruction wrapper = context.Function(tVoid, FunctionControlMask.MaskNone, context.TypeFunction(tVoid, false));
+            context.AddFunction(wrapper);
+            context.AddLabel(context.Label());
+
+            SpvInstruction Barrier() => context.ControlBarrier(U(2), U(2), U(0x108));   // Workgroup, Workgroup, AcquireRelease | WorkgroupMemory
+            void Guarded(SpvInstruction cond, Action then)
+            {
+                SpvInstruction thenLabel = context.Label(), mergeLabel = context.Label();
+                context.SelectionMerge(mergeLabel, SelectionControlMask.MaskNone);
+                context.BranchConditional(cond, thenLabel, mergeLabel);
+                context.AddLabel(thenLabel);
+                then();
+                context.Branch(mergeLabel);
+                context.AddLabel(mergeLabel);
+            }
+
+            SpvInstruction pOutF32 = context.TypePointer(StorageClass.Output, tF32), pOutVec4 = context.TypePointer(StorageClass.Output, tVec4);
+            SpvInstruction lid = context.Load(tU32, lidVar);
+            SpvInstruction pPayload = context.TypePointer(StorageClass.TaskPayloadWorkgroupEXT, tU32);
+
+            // Metal's threadgroup memory starts with whatever was there: a workgroup that leaves before writing its counts (task: mesh groups to launch; mesh: the header with the
+            // primitive count) would hand Metal a garbage count. Both start at 0, as on the Switch 2
+            if (mesh.IsTask)
+            {
+                context.Store(context.AccessChain(pPayload, payload, U(1)), U(0));
+            }
+            else
+            {
+                context.Store(context.AccessChain(context.TypePointer(StorageClass.Workgroup, tU32), context.SharedMemories[mesh.PrimitiveMemoryId], U(0)), U(0));
+
+                // Every primitive's per-primitive outputs start as (0, 0, 0, 1); the program then writes its components straight into them (MeshPlaneStore below)
+                if (primGenerics.Count != 0)
+                {
+                    for (int k = 0; k * threads < mesh.MaxPrimitives; k++)
+                    {
+                        SpvInstruction t = context.IAdd(tU32, lid, U((uint)(k * threads)));
+                        Guarded(context.ULessThan(tBool, t, U((uint)mesh.MaxPrimitives)), () =>
+                        {
+                            foreach (SpvInstruction pv in primGenerics.Values)
+                            {
+                                context.Store(context.AccessChain(pOutVec4, pv, t), context.ConstantComposite(tVec4, context.Constant(tF32, 0f), context.Constant(tF32, 0f), context.Constant(tF32, 0f), context.Constant(tF32, 1f)));
+                            }
+                        });
+                    }
+                }
+            }
+            Barrier();
+
+            context.FunctionCall(tVoid, body);
+            Barrier();
+
+            if (mesh.IsTask)
+            {
+                SpvInstruction count = context.Load(tU32, context.AccessChain(pPayload, payload, U(1)));
+                count = context.Select(tU32, context.ULessThan(tBool, count, U(1024)), count, U(1024));   // Metal's limit of mesh groups per object group
+                Barrier();   // every thread has read the count before word 0 changes
+                context.Store(context.AccessChain(pPayload, payload, U(0)), U(0));
+                Barrier();
+                context.EmitMeshTasksEXT(count, U(1), U(1), payload);
+            }
+            else
+            {
+                SpvInstruction planes = context.SharedMemories[mesh.PlaneMemoryId], prims = context.SharedMemories[mesh.PrimitiveMemoryId];
+                SpvInstruction pWg = context.TypePointer(StorageClass.Workgroup, tU32);
+                SpvInstruction header = context.Load(tU32, context.AccessChain(pWg, prims, U(0)));
+                SpvInstruction primCount = context.BitwiseAnd(tU32, context.ShiftRightLogical(tU32, header, U(24)), U(0xff));
+                primCount = context.Select(tU32, context.ULessThan(tBool, primCount, U((uint)mesh.MaxPrimitives)), primCount, U((uint)mesh.MaxPrimitives));
+                context.SetMeshOutputsEXT(U((uint)mesh.MaxVertices), primCount);
+
+                SpvInstruction pOutUVec3 = context.TypePointer(StorageClass.Output, tUVec3);
+                SpvInstruction Byte(SpvInstruction address)
+                {
+                    SpvInstruction w = context.BitwiseAnd(tU32, context.ShiftRightLogical(tU32, address, U(2)), U((uint)(mesh.PrimitiveWords - 1)));
+                    SpvInstruction shift = context.IMul(tU32, context.BitwiseAnd(tU32, address, U(3)), U(8));
+                    return context.BitwiseAnd(tU32, context.ShiftRightLogical(tU32, context.Load(tU32, context.AccessChain(pWg, prims, w)), shift), U(0xff));
+                }
+
+                for (int k = 0; k * threads < mesh.MaxPrimitives; k++)
+                {
+                    SpvInstruction t = context.IAdd(tU32, lid, U((uint)(k * threads)));
+                    Guarded(context.ULessThan(tBool, t, primCount), () =>
+                    {
+                        SpvInstruction a = context.IAdd(tU32, context.IMul(tU32, t, U(3)), U(4));
+                        SpvInstruction tri = context.CompositeConstruct(tUVec3, Byte(a), Byte(context.IAdd(tU32, a, U(1))), Byte(context.IAdd(tU32, a, U(2))));
+                        context.Store(context.AccessChain(pOutUVec3, idxVar, t), tri);
+
+                    });
+                }
+
+                context.Return();
+            }
+
+            context.FunctionEnd();
+
+            // The mesh program's stores into its per-vertex / per-primitive values (MeshShaderInfo window 4, CodeGenContext.MeshPlaneStore), straight into the outputs: word w is
+            // vertex (w / chunk) x 32 + w % 32, plane (w % chunk) / 32 below the per-primitive base, the same for primitives above it (chunk = 32 x planes)
+            if (mesh.IsMesh && context.HasMeshPlaneStore)
+            {
+                SpvInstruction store = context.MeshPlaneStore;
+                context.AddFunction(store);
+                SpvInstruction word = context.FunctionParameter(tU32), value = context.FunctionParameter(tU32);
+                context.AddLabel(context.Label());
+                SpvInstruction f = context.Bitcast(tF32, value);
+
+                void Scatter(SpvInstruction w, int chunkWords, int count, int[] planes, Func<SpvInstruction, int, SpvInstruction> target)
+                {
+                    if (chunkWords == 0)
+                    {
+                        return;
+                    }
+
+                    SpvInstruction rem = context.UMod(tU32, w, U((uint)chunkWords));
+                    SpvInstruction plane = context.ShiftRightLogical(tU32, rem, U(5));
+                    SpvInstruction index = context.IAdd(tU32, context.IMul(tU32, context.UDiv(tU32, w, U((uint)chunkWords)), U(32)), context.BitwiseAnd(tU32, rem, U(31)));
+                    Guarded(context.ULessThan(tBool, index, U((uint)count)), () =>
+                    {
+                        for (int n = 0; n < planes.Length; n++)
+                        {
+                            SpvInstruction t = target(index, planes[n]);
+                            if (t != null)
+                            {
+                                Guarded(context.IEqual(tBool, plane, U((uint)n)), () => context.Store(t, f));
+                            }
+                        }
+                    });
+                }
+
+                SpvInstruction isVertex = context.ULessThan(tBool, word, U((uint)mesh.PrimitiveBaseWord));
+                Guarded(isVertex, () => Scatter(word, mesh.VertexChunkWords, mesh.MaxVertices, mesh.Planes, (v, plane) => plane < 4
+                    ? context.AccessChain(pOutF32, posVar, v, U(0), U((uint)plane))
+                    : context.AccessChain(pOutF32, generics[(plane - 4) >> 2], v, U((uint)(plane & 3)))));
+                Guarded(context.LogicalNot(tBool, isVertex), () => Scatter(context.ISub(tU32, word, U((uint)mesh.PrimitiveBaseWord)), mesh.PrimitiveChunkWords, mesh.MaxPrimitives, mesh.PrimitivePlanes,
+                    (t, plane) => plane < 4 || !primGenerics.ContainsKey((plane - 4) >> 2) ? null : context.AccessChain(pOutF32, primGenerics[(plane - 4) >> 2], t, U((uint)(plane & 3)))));
+                context.Return();
+                context.FunctionEnd();
+            }
+
+            foreach (SpvInstruction global in context.GlobalVariables)   // SPIR-V 1.4: every global, not only the inputs and outputs
+            {
+                if (!io.Contains(global))
+                {
+                    io.Add(global);
+                }
+            }
+
+            context.AddEntryPoint(mesh.IsTask ? ExecutionModel.TaskEXT : ExecutionModel.MeshEXT, wrapper, "main", io.ToArray());
+            context.AddExecutionMode(wrapper, ExecutionMode.LocalSize,
+                (SpvLiteralInteger)context.Definitions.ComputeLocalSizeX, (SpvLiteralInteger)context.Definitions.ComputeLocalSizeY, (SpvLiteralInteger)context.Definitions.ComputeLocalSizeZ);
+            if (mesh.IsMesh)
+            {
+                context.AddExecutionMode(wrapper, ExecutionMode.OutputVertices, (SpvLiteralInteger)mesh.MaxVertices);
+                context.AddExecutionMode(wrapper, ExecutionMode.OutputPrimitivesEXT, (SpvLiteralInteger)mesh.MaxPrimitives);
+                context.AddExecutionMode(wrapper, ExecutionMode.OutputTrianglesEXT);
+            }
         }
 
         private static void Generate(CodeGenContext context, StructuredProgramInfo info, int funcIndex)
@@ -189,7 +422,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
             context.FunctionEnd();
 
-            if (funcIndex == 0)
+            if (funcIndex == 0 && context.Properties.Mesh == null)   // a task / mesh program's entry point is GenerateMeshEntry's wrapper
             {
                 context.AddEntryPoint(context.Definitions.Stage.Convert(), spvFunc, "main", context.GetMainInterface());
 

@@ -44,6 +44,12 @@ BF_WANT = {line.strip() for line in open(BF_WANT_FILE) if line.strip() and not l
 DUAL_WANT_FILE = str(GAME.table('dual_want.tsv'))   # pixel shaders a pipeline blends with their output 1 as the second source (see fs_dual), produced by the host (DM_NVN_DUAL_WANT)
 DUAL_WANT = {line.split()[0] for line in open(DUAL_WANT_FILE) if line.strip() and not line.lstrip().startswith('#')} if os.path.exists(DUAL_WANT_FILE) else set()
 XC = ['--msl', '--msl-version', '20300', '--msl-argument-buffers', '--msl-texture-buffer-native', '--msl-pad-fragment-output']
+# Switch 2 task / mesh programs (stage ts / ms, nx2_split.py) become Metal object / mesh functions, which need MSL 3.0 (3.1 stays when image atomics ask for it)
+def xc_args(j, spv):
+    args = dmsh_atomic.cross_args(XC, spv)
+    if j['stage'] in ('ts', 'ms'):
+        i = args.index('--msl-version') + 1; args[i] = str(max(int(args[i]), 30000))
+    return args
 # spirv-cross writes the translator's FMin / FMax / FClamp as fast::min / max / clamp, whose result for a NaN operand is the GPU's choice; Maxwell's FMNMX returns the other operand
 # and its saturation gives 0, as Metal's precise:: functions (IEEE fmin / fmax) do on every GPU. The M4 Pro's fast ones happen to agree, an A20 Pro's do not: Super Mario Galaxy 2's
 # GX lighting takes max(0, NaN) from light directions left at zero, and the half of Mario its fill light faces came out white on the iPhone (GitHub issue 72; vk_shaders.py PRECISE)
@@ -69,6 +75,7 @@ def border_emu(msl):
     """The samples of the argument buffer's textures through its sampler members, T.sample(S, args) → dm_bs(T.sample(S, args), block, bit, T, S_w, args) (see BORDER_HELPERS);
     the source unchanged when it samples through none. Only samples of float textures: an integer texture is not filtered, and its border colour is Maxwell's integer one, which
     the host does not correct (it keeps Metal's nearest)"""
+    if os.environ.get('DMSH_BORDER_EMU', '1') == '0': return msl   # off (Mario Kart World: no sampler with a border colour Metal lacks in any captured frame; the uniform branch after each sample keeps cb_hoist from paying off)
     body = re.search(r'struct spvDescriptorSetBuffer0\s*\{(.*?)\};', msl, re.S)
     if not body: return msl
     # members with attributes after their id too (see reflect): the twins' ids go after every one of them
@@ -93,6 +100,42 @@ def border_emu(msl):
         twin = f'spvDescriptorSet0.{m.group(2)}{abi.BORDER_TWIN}'
         msl = msl[:m.start()] + f'dm_bs({msl[m.start():i]}, spvDescriptorSet0.{abi.BORDER_MEMBER}, {bit[m.group(2)]}u, spvDescriptorSet0.{m.group(1)}, {twin}, {args})' + msl[i:]
     return msl.replace('using namespace metal;\n', 'using namespace metal;\n' + BORDER_HELPERS, 1)
+# Uniform-buffer reads hoisted to the top of each function (DMSH_CB_HOIST=0 off): reads through the argument buffer's constant pointers, (*spvDescriptorSet0.c)._m0[N], are
+# memory loads Apple's compiler repeats at every use (Mario Kart World's cube-map filter 83ea368cd702b9de reads 65 entries 2,515 times: 1.55 ms a 64x64 pass, 0.24 ms with each
+# entry loaded once and the border branches off (DMSH_BORDER_EMU=0), same pixels; either change alone gains nothing). Runs on the final text inside the Metal
+# compile (dmsh_mtlcache.PRE), after every rewrite that matches these reads (vs_base_instance's c0 row 100: hoisted first, 137 vertex shaders lost their base instance and
+# instanced objects flickered, playtest 74). Only entries no higher than one the function reads unconditionally (at its top level) are hoisted, so no load can pass the buffer's end
+def cb_hoist(msl):
+    if os.environ.get('DMSH_CB_HOIST', '1') == '0': return msl
+    types = {m.group(1) for m in re.finditer(r'struct (\w+)\s*\{\s*float4 _m0\[\d+\];\s*\};', msl)}
+    if not types: return msl
+    names = {m.group(2) for m in re.finditer(r'constant (\w+)\* (\w+) \[\[id\(\d+\)\]\];', msl) if m.group(1) in types}
+    if not names: return msl
+    acc = re.compile(r'\(\*spvDescriptorSet0\.(' + '|'.join(sorted(names)) + r')\)\._m0\[(\d+)\]')
+    lines = msl.split('\n'); out = []; i = 0
+    while i < len(lines):
+        out.append(lines[i])
+        if lines[i] == '{' and i and 'spvDescriptorSet0' in lines[i - 1]:
+            j, d = i + 1, 1
+            body = []
+            while j < len(lines):
+                l = lines[j]
+                if d == 1 and l == '}': break
+                body.append((d, l)); d += l.count('{') - l.count('}'); j += 1
+            top = {}
+            for dd, l in body:
+                if dd == 1:
+                    for m in acc.finditer(l): top[m.group(1)] = max(top.get(m.group(1), -1), int(m.group(2)))
+            used = sorted({(m.group(1), int(m.group(2))) for _, l in body for m in acc.finditer(l) if int(m.group(2)) <= top.get(m.group(1), -1)})
+            if used:
+                out += [f'    const float4 dmk_{c}_{n} = (*spvDescriptorSet0.{c})._m0[{n}];' for c, n in used]
+                sub = lambda m: f'dmk_{m.group(1)}_{m.group(2)}' if int(m.group(2)) <= top.get(m.group(1), -1) else m.group(0)
+                out += [acc.sub(sub, l) for _, l in body]
+            else: out += [l for _, l in body]
+            i = j; continue
+        i += 1
+    return '\n'.join(out)
+dmsh_mtlcache.PRE = cb_hoist
 CAS =os.environ.get('DMSH_CAS', os.path.join(cache_root, 'cas'))
 CAS_LOCKS, CAS_LOCKS_GUARD = {}, threading.Lock()
 PRE_STATS = collections.Counter()
@@ -119,7 +162,7 @@ def mac_compile(msl, air, lib):   # same interface as ios_metal.compile
 #   c2 C2_SAMP + 8 r: separate samplers (nvnCommandBufferBindSeparateSampler), slot r < C2_SEP_SLOTS
 #   c0 base + 0x10 r: storage buffer r (64-bit address, 32-bit size), base C0_SSBO_<stage> (the hull / domain stages' bases were never seen)
 TEX_BASE, IMG_BASE, IMG_SLOTS, SEPTEX_BASE, SEPTEX_SLOT0, SAMP_BASE = abi.C2_TEX, abi.C2_IMG, abi.C2_IMG_SLOTS, abi.C2_SEPTEX, abi.SEPTEX_SLOT0, abi.C2_SAMP
-SSBO = {'vs': abi.C0_SSBO_VS, 'cs': abi.C0_SSBO_CS, 'gs': abi.C0_SSBO_GS, 'ps': abi.C0_SSBO_PS}
+SSBO = {'vs': abi.C0_SSBO_VS, 'cs': abi.C0_SSBO_CS, 'gs': abi.C0_SSBO_GS, 'ps': abi.C0_SSBO_PS, 'ts': abi.C0_SSBO_TS, 'ms': abi.C0_SSBO_MS}   # Switch 2 task / mesh (nx2_split.py)
 
 def records(d):
     r = [m.start() for m in re.finditer(b'BTCDBTCD', d)]
@@ -446,7 +489,7 @@ def job_for(key, name, rec, w):
     c1 = rec[0x38 + c1o:0x38 + c1t]
     ab = vertex_ab(key, code, rec[ci:]) if stage == 'vs' else None
     if ab: code, c1 = ab
-    if stage != 'cs': code = code[0x30:]   # strip the 0x30 header (the 0x50 SPH after it is read by the translator itself)
+    if stage not in ('cs', 'ts', 'ms'): code = code[0x30:]   # strip the 0x30 header (the 0x50 SPH after it is read by the translator itself); Switch 2 task / mesh come compute-shaped
     elif code[:4] == bytes.fromhex('79563412'):
         # Compute in this game has a header (magic 0x12345679; D2R's package records have none): 0x30 header + zero padding, instructions start at code area +0x100 (measured on all 71; the BRA-to-self and the control words are 32-byte aligned to this start).
         # Stripping only 0x30 made the translator decode from +0x30: the control word every 32 bytes is off by 0x10 and the jump tables of indirect BRX (relative to the program start) are all misplaced → particle / post-effect compute shaders loop forever and hang the GPU.
@@ -513,19 +556,43 @@ def vs_tf(src, tf, geometry=False):
     return decl + f'\nvertex void main0_tf({params}{extra})\n{{\n' + pro + body.replace('return out;', '{ if (dm_linear < dm_tf.args.x) { ' + ' '.join(stores) + ' } return; }')
 
 
-def vs_writes(src, binds):
-    """Whether a vertex shader has side effects that a draw with rasterizer discard still runs, so that it needs main0_discard: storage buffer writes (Xenoblade Chronicles 3's
-    vertex-only work before its skinned models) or image stores (Metroid Prime Remastered's volumetric fog: 1cbc19f806a08166 fills its 100x57x64 RGBA16F froxel volume from
-    5,700 points with rasterization off; without the entry the host skipped the draw, the volume stayed zero and the fog pass blended every scene to black)"""
-    return any(b.get('rw') for b in binds) or bool(re.search(r'access::(read_)?write\b', src))
-
-
 def vs_discard(src):
     """Metal requires a void vertex entry when rasterization is disabled.
     Preserve all original side effects and early returns; omit only outputs."""
     m = re.search(r'\bvertex\s+main0_out\s+main0\s*\((.*?)\)\s*\{', src, re.S)
     if not m: raise ValueError('vertex shader has no main0 entry for rasterizer discard')
     return '\nvertex void main0_discard(' + m.group(1) + ')\n{' + src[m.end():].replace('return out;', 'return;')
+
+def pos_affine(src, attr):
+    """raster_facts fallback for full-screen draws (Mario Kart World: position .xy = attribute .xy x 2, z a literal through the GL depth rewrite), read from main0 itself (the
+    file's last function is main0_gs once the entry variants are added): position .x / .y = the same attribute's .x / .y times a literal plus a literal, z a literal (optionally
+    followed by the rewrite z' = z / 2 + w / 2 that main0 carries in the GL depth mode), w the literal 1 everywhere, no branches.
+    → {'pos_attr': -1, 'pos_aff_attr': A, 'pos_aff': [sx, ox, sy, oy, final clip z]}; None if anything else. A separate key, so a host that knows only pos_attr treats it as unprovable"""
+    m = re.search(r'\bvertex\s+main0_out\s+main0\s*\([^)]*\)\s*\{(.*?)\n\}', src, re.S)
+    if not m or re.search(r'\b(if|for|while|switch|do)\b|clip_distance|ClipDistance', m.group(1)): return None
+    b = m.group(1)
+    var = {m.group(1): (m.group(2), m.group(3)) for m in re.finditer(r'float\s+(_\w+)\s*=\s*in\.(\w+)\.([xyzw]);', b)}
+    last = {}
+    for m in re.finditer(r'out\.gl_Position\.([xyzw])\s*=\s*([^;]+);', b): last[m.group(1)] = m.group(2).strip()
+    num = r'(-?\d+(?:\.\d+)?(?:e[-+]?\d+)?)'
+    def lin(v):
+        if v in var: return var[v] + (1.0, 0.0)
+        m = re.search(r'float %s = (_\w+) \* %s;' % (re.escape(v), num), b)
+        if m and m.group(1) in var: return var[m.group(1)] + (float(m.group(2)), 0.0)
+        m = re.search(r'float %s = fma\((_\w+), %s, %s\);' % (re.escape(v), num, num), b)
+        if m and m.group(1) in var: return var[m.group(1)] + (float(m.group(2)), float(m.group(3)))
+        return None
+    if re.search(r'out\.gl_Position\s*=', b): return None
+    lx, ly = lin(last.get('x', '')), lin(last.get('y', ''))
+    if not lx or not ly or lx[0] != ly[0] or lx[0] not in attr or lx[1] != 'x' or ly[1] != 'y': return None
+    if any(w != '1.0' for w in re.findall(r'out\.gl_Position\.w\s*=\s*([^;]+);', b)): return None
+    zs = [z.strip() for z in re.findall(r'out\.gl_Position\.z\s*=\s*([^;]+);', b)]
+    if zs and zs[-1] == 'fma(out.gl_Position.z, 0.5, out.gl_Position.w * 0.5)':
+        if len(zs) < 2 or not re.fullmatch(num, zs[-2]): return None
+        z = float(zs[-2]) * 0.5 + 0.5
+    elif zs and re.fullmatch(num, zs[-1]): z = float(zs[-1])
+    else: return None
+    return {'pos_attr': -1, 'pos_aff_attr': attr[lx[0]], 'pos_aff': [lx[2], lx[3], ly[2], ly[3], z]}
 
 def raster_facts(stage, src):
     """Static facts needed for the runtime proof that the load can be skipped (full-coverage first draw) (nvn_mtl.m first_draw_covers):
@@ -536,16 +603,16 @@ def raster_facts(stage, src):
         return {'discard': int('discard_fragment' in src), 'sample_mask': int('sample_mask' in (out.group(1) if out else '')),
                 'colors': sorted({int(x) for x in re.findall(r'\[\[color\((\d+)\)\]\]', out.group(1) if out else '')})}
     if stage != 'vs': return {}
-    body = re.search(r'\bvertex\s+\w+\s+\w+\s*\(.*?\)\s*\{(.*)\}\s*$', src, re.S)   # the main function is the last function in the file
-    if not body or re.search(r'\b(if|for|while|switch|do)\b|clip_distance|ClipDistance', body.group(1)): return {'pos_attr': -1}
-    b = body.group(1)
     attr = {m.group(2): int(m.group(3)) for m in re.finditer(r'(\w+)\s+(\w+)\s*\[\[attribute\((\d+)\)\]\]', src)}
+    body = re.search(r'\bvertex\s+\w+\s+\w+\s*\(.*?\)\s*\{(.*)\}\s*$', src, re.S)   # the main function is the last function in the file
+    if not body or re.search(r'\b(if|for|while|switch|do)\b|clip_distance|ClipDistance', body.group(1)): return pos_affine(src, attr) or {'pos_attr': -1}
+    b = body.group(1)
     var = {m.group(1): (m.group(2), m.group(3)) for m in re.finditer(r'float\s+(_\w+)\s*=\s*in\.(\w+)\.([xyzw]);', b)}
     last = {}
     for m in re.finditer(r'out\.gl_Position\.([xyzw])\s*=\s*([^;]+);', b): last[m.group(1)] = m.group(2).strip()
     src_of = {c: var.get(v) for c, v in last.items()}
     m0 = src_of.get('x')
-    if not m0 or m0[0] not in attr or any(src_of.get(c) != (m0[0], c) for c in 'xyz'): return {'pos_attr': -1}
+    if not m0 or m0[0] not in attr or any(src_of.get(c) != (m0[0], c) for c in 'xyz'): return pos_affine(src, attr) or {'pos_attr': -1}
     if last.get('w') == '1.0': w = 'one'
     elif src_of.get('w') == (m0[0], 'w'): w = 'attr'
     else: return {'pos_attr': -1}
@@ -738,20 +805,15 @@ def drv_reads(src):
         if offs or dyn: out[str(bank)] = {'vec4_offsets': sorted(offs), 'dynamic': dyn}
     return out
 
-SAMPLE_ROWS = [(abi.C0_SAMPLE_TABLE, abi.C0_SAMPLE_TABLE + abi.C0_SAMPLE_BYTES), (abi.C0_SAMPLE_INFO, abi.C0_SAMPLE_INFO + abi.C0_ROW)]   # c0: the pixel stage's sample position rows
-
-def unfillable(dr, stage):
+def unfillable(dr):
     bad = []
     for bank, d in dr.items():
-        fill = DRV_FILL[int(bank)] + (SAMPLE_ROWS if bank == '0' and stage == 'ps' else [])
         # a computed index into c2 reads one of its handle tables, which the replay layer fills whole (nvn_mtl.m DRV2: EA SPORTS FC 27's lights read the separate texture words
-        # at 0x168 + 8i to test each light's handle); c0 is filled only in its tables and words above, so a computed index there may read what the replay does not write.
-        # The one computed c0 index known is GLSLC's sample position lookup in a pixel shader: a byte of the table at 0x620, at an index made of the sample index (PIXLD.MYINDEX)
-        # and the pixel's place in the location grid masked by the words of the 0x630 row, at most 15 (Metroid Prime Remastered: 30 of its 438 shaders that read the sample index)
-        if d['dynamic'] and bank == '0' and not (stage == 'ps' and abi.C0_SAMPLE_INFO in d['vec4_offsets']): bad.append(f'c{bank} dynamic index')
+        # at 0x168 + 8i to test each light's handle); c0 is filled only in its tables and words above, so a computed index there may read what the replay does not write
+        if d['dynamic'] and bank == '0': bad.append(f'c{bank} dynamic index')
         for o in d['vec4_offsets']:
             # a read is a 16-byte row: overlapping any table is enough (Engage reads the c2+0x160 row for texture slot 0 at 0x168 in it)
-            if not any(o < b and a < o + 16 for a, b in fill): bad.append(f'c{bank}+{o:#x}')
+            if not any(o < b and a < o + 16 for a, b in DRV_FILL[int(bank)]): bad.append(f'c{bank}+{o:#x}')
     return bad
 
 RULES = []   # MSL rewrite rules attached by shader name (function, applicability test); the former dark-range remap toe has been removed (back to the original Switch brightness)
@@ -923,6 +985,29 @@ def vs_depth(src):
     if not m: sys.exit('[RED] vertex shader without a main0 main function, cannot add the depth entry points')
     body = src[m.start():]   # the main function is the last function in the file
     gl = body.replace('return out;', 'out.gl_Position.z = fma(out.gl_Position.z, 0.5, out.gl_Position.w * 0.5);\n    return out;')
+    single = src[:m.start()] + gl
+    return single, single + '\n' + re.sub(r'\bmain0\s*\(', 'main0_z(', body, count=1)
+
+def ms_pad(src):
+    """A Switch 2 mesh program declares an output for every generic location 0-7 (Ryujinx GenerateMeshEntry: a pixel shader may read one it does not write, and Metal refuses or
+    crashes on the pipeline otherwise) but writes only its own. spirv-cross keeps every mesh output in a threadgroup array (4 KB per output at 256 vertices; Metal gives a mesh
+    function 32 KB): an output array the shader never indexes but in the final copy (spvV.m_N = _N[spvVI]) shrinks to one element and the copy becomes (0, 0, 0, 1), as vs_pad gives a
+    vertex shader's unwritten outputs. → the source"""
+    for name in sorted(set(re.findall(r'spvV\.m_\w+ = (_\d+)\[spvVI\];', src))):
+        if src.count(name + '[') != src.count(name + '[spvVI]'): continue   # written by the shader: a real output
+        src = re.sub(r'spvUnsafeArray<float4, \d+>(&?) ' + re.escape(name) + r'\b', r'spvUnsafeArray<float4, 1>\1 ' + name, src)
+        src = src.replace(name + '[spvVI]', 'float4(0.0, 0.0, 0.0, 1.0)')
+    return src
+
+def ms_depth(src):
+    """A Switch 2 mesh program's positions take the depth convention as a vertex shader's do (see vs_depth): main0 gets the GL convention's z' = z/2 + w/2 on every vertex it hands
+    to Metal (spirv-cross copies the per-vertex outputs into spvV, then set_vertex), main0_z keeps z. → (the source with only main0, the full source)"""
+    m = re.search(r'\[\[mesh\]\]\s+void\s+main0\s*\(', src)
+    if not m: sys.exit('[RED] mesh shader without a main0 mesh function, cannot add the depth entry points')
+    body = src[m.start():]
+    copy = 'spvV.gl_Position = gl_MeshVerticesEXT[spvVI].gl_Position;'
+    if body.count(copy) != 1: sys.exit('[RED] mesh shader: the position copy spirv-cross writes was not found once, cannot add the depth entry points')
+    gl = body.replace(copy, copy + '\n        spvV.gl_Position.z = fma(spvV.gl_Position.z, 0.5, spvV.gl_Position.w * 0.5);')
     single = src[:m.start()] + gl
     return single, single + '\n' + re.sub(r'\bmain0\s*\(', 'main0_z(', body, count=1)
 
@@ -1104,7 +1189,7 @@ def finish(key, w, j, c1):
         try: return geometry_finish(key, w, j, c1)
         except (ValueError, subprocess.CalledProcessError) as e: return 'geometry failed', str(e)[:160], None
     if j['stage'] == 'vs': spv_single_lane(os.path.join(w, key + '.spv'))   # one-lane subgroups (see spv_single_lane)
-    r = subprocess.run([SPIRV_CROSS, *dmsh_atomic.cross_args(XC, os.path.join(w, key + '.spv')), os.path.join(w, key + '.spv'), '--output', msl], capture_output=True, text=True)
+    r = subprocess.run([SPIRV_CROSS, *xc_args(j, os.path.join(w, key + '.spv')), os.path.join(w, key + '.spv'), '--output', msl], capture_output=True, text=True)
     if r.returncode: return 'MSL failed', r.stderr.strip()[:160], None
     src = open(msl).read()
     if j['stage'] == 'vs':   # second pass: re-translate with inputs that are only used as integers reported as uint (see int_inputs)
@@ -1114,7 +1199,7 @@ def finish(key, w, j, c1):
             rx = subprocess.run([XLATE, jp, w], capture_output=True, text=True)
             if rx.returncode or not os.path.exists(os.path.join(w, key + '.spv')): return 'translation failed', ('integer-input retranslation: ' + rx.stderr.strip())[:160], None
             spv_single_lane(os.path.join(w, key + '.spv'))
-            r = subprocess.run([SPIRV_CROSS, *dmsh_atomic.cross_args(XC, os.path.join(w, key + '.spv')), os.path.join(w, key + '.spv'), '--output', msl], capture_output=True, text=True)
+            r = subprocess.run([SPIRV_CROSS, *xc_args(j, os.path.join(w, key + '.spv')), os.path.join(w, key + '.spv'), '--output', msl], capture_output=True, text=True)
             if r.returncode: return 'MSL failed', r.stderr.strip()[:160], None
             src = open(msl).read()
     try: src = dmsh_atomic.check_msl(src)
@@ -1135,12 +1220,14 @@ def finish(key, w, j, c1):
         capture = dmsh_geometry.capture(src)
         src, full = vs_depth(src)
         full += capture
-        discard = vs_writes(src, reflect(key, 'vs', src, res))
+        discard = any(b.get('rw') for b in reflect(key, 'vs', src, res))
         if discard: full += vs_discard(src)
         if j.get('tf'): full += vs_tf(src, j['tf'])   # transform feedback capture (see vs_tf)
         plain = full
         full, lay = vs_layer_entry(full)   # layer entry points for a slice-writing geometry shader (see vs_layer_entry)
         open(msl, 'w').write(full)
+    if j['stage'] == 'ms':   # the padding outputs as constants (see ms_pad), then the two depth-convention entry points (see ms_depth)
+        src, full = ms_depth(ms_pad(src)); open(msl, 'w').write(full)
     fu, fmask = fs_uint(src) if j['stage'] == 'ps' else (None, 0)   # the integer-output entry points (see fs_uint); the analysis below uses the source with only main0
     fd = fs_dual(src) if j['stage'] == 'ps' and key in DUAL_WANT else None   # the dual-source entry point (see fs_dual), from the source with only main0
     if fu or fd: plain = src; open(msl, 'w').write((fu or src) + (fd or ''))
@@ -1154,16 +1241,16 @@ def finish(key, w, j, c1):
         try: compile_targets()
         except subprocess.CalledProcessError as e: return 'metal failed', str(e)[:160], None
     clone(msl, os.path.join(out, key + '_b.metal'))
-    entry = re.search(r'(vertex|fragment|kernel)\s+\S+\s+(\w+)\s*\(', src)
+    entry = re.search(r'(vertex|fragment|kernel|\[\[object\]\]|\[\[mesh\]\])\s+\S+\s+(\w+)\s*\(', src)
     dr = drv_reads(src)
     try: binds = reflect(key, j['stage'], src, res)
     except ValueError as e: return 'reflection failed', str(e)[:160], None
     refl = {'key': key + '_b', 'route': 'B', 'chain': CHAIN, 'dm_ctl': key, 'source': f'{name}#{k}', 'pc_paired': pc_of[key], 'stage': j['stage'],
-            'entry': entry.group(2) if entry else 'main0', 'msl_entry_kind': entry.group(1) if entry else None, **({'entry_z': 'main0_z', 'entry_geometry_capture': 'main0_gs'} if j['stage'] == 'vs' else {}),
+            'entry': entry.group(2) if entry else 'main0', 'msl_entry_kind': entry.group(1).strip('[]') if entry else None, **({'entry_z': 'main0_z', 'entry_geometry_capture': 'main0_gs'} if j['stage'] == 'vs' else {'entry_z': 'main0_z'} if j['stage'] == 'ms' else {}),
             **({'entry_discard': 'main0_discard'} if discard else {}),
             **({'entry_tf': 'main0_tf', 'tf_strides': [e['stride'] if e else 0 for e in j['tf']]} if j.get('tf') else {}),
             **({'entry_layer': 'main0_l', 'entry_layer_z': 'main0_lz', 'layer_from': lay} if lay else {}), **({'entry_u': 'main0_u'} if fu else {}), **({'entry_m': 'main0_m', 'uint_mask_m': fmask} if fu and fmask else {}), **({'entry_d': 'main0_d'} if fd else {}),
-            'threadgroup_size': j.get('local'), 'c1': c1.hex(), 'notes': res['notes'] + (['not in the answer table, queries use defaults'] if j.get('no_facts') else []), 'drv_reads': dr, 'drv_unfillable': unfillable(dr, j['stage']),
+            'threadgroup_size': j.get('local'), 'c1': c1.hex(), 'notes': res['notes'] + (['not in the answer table, queries use defaults'] if j.get('no_facts') else []), 'drv_reads': dr, 'drv_unfillable': unfillable(dr),
             'bindings': binds,
             'vertex_inputs': [{'location': int(m.group(2)), 'msl_type': m.group(1)} for m in re.finditer(r'(\w+)\s+\w+\s*\[\[attribute\((\d+)\)\]\]', src)],
             'raster': raster_facts(j['stage'], src), 'vs_pad': pad}

@@ -89,3 +89,45 @@ _nvn_big_entry:
     add x17, x17, _nvn_big_real@PAGEOFF
     ldr x16, [x17, x16, lsl #3]
     b _dm_bigstack_enter
+
+// Asynchronous-submission gate (DM_NVN_ASYNC_SUBMIT=1; hle_nvn.c nvn_gate_c): when the thunk comes in, x16 = this function's slot address. Save x0-x7 / q0-q7, call nvn_gate_c(i)
+// (waits until the submission worker has run everything queued), restore them and tail-call nvn_gate_real[i] with x16 = the slot address again (the big-stack entry needs it)
+    .globl _nvn_gate_entry
+    .p2align 2
+_nvn_gate_entry:
+    sub sp, sp, #224
+    stp x29, x30, [sp]
+    mov x29, sp
+    stp x0, x1, [sp, #16]
+    stp x2, x3, [sp, #32]
+    stp x4, x5, [sp, #48]
+    stp x6, x7, [sp, #64]
+    str x16, [sp, #80]
+    stp q0, q1, [sp, #96]
+    stp q2, q3, [sp, #128]
+    stp q4, q5, [sp, #160]
+    stp q6, q7, [sp, #192]
+    adrp x9, _nvn_slot@PAGE
+    add x9, x9, _nvn_slot@PAGEOFF
+    sub x0, x16, x9
+    lsr x0, x0, #4                   // Slot index i
+    bl _nvn_gate_c
+    ldr x16, [sp, #80]
+    adrp x9, _nvn_slot@PAGE
+    add x9, x9, _nvn_slot@PAGEOFF
+    sub x10, x16, x9
+    lsr x10, x10, #4
+    adrp x9, _nvn_gate_real@PAGE
+    add x9, x9, _nvn_gate_real@PAGEOFF
+    ldr x17, [x9, x10, lsl #3]
+    ldp x0, x1, [sp, #16]
+    ldp x2, x3, [sp, #32]
+    ldp x4, x5, [sp, #48]
+    ldp x6, x7, [sp, #64]
+    ldp q0, q1, [sp, #96]
+    ldp q2, q3, [sp, #128]
+    ldp q4, q5, [sp, #160]
+    ldp q6, q7, [sp, #192]
+    ldp x29, x30, [sp]
+    add sp, sp, #224
+    br x17

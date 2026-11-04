@@ -19,6 +19,9 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
         public IReadOnlyDictionary<int, MemoryDefinition> LocalMemories => _localMemories;
         public IReadOnlyDictionary<int, MemoryDefinition> SharedMemories => _sharedMemories;
 
+        // nxnative: set for a Switch 2 task / mesh program at its first stage-memory instruction (InstEmitMemory)
+        public MeshShaderInfo Mesh { get; set; }
+
         public ShaderProperties()
         {
             _constantBuffers = new Dictionary<int, BufferDefinition>();

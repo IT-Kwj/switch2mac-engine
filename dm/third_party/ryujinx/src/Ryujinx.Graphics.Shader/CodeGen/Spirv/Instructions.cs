@@ -1780,6 +1780,17 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
         private static OperationResult GenerateLoadOrStore(CodeGenContext context, AstOperation operation, bool isStore)
         {
+            // nxnative: a Switch 2 mesh program's store into its per-vertex / per-primitive values: written into the mesh outputs at once (CodeGenContext.MeshPlaneStore), so the values are
+            // not held twice in threadgroup memory (spirv-cross keeps the mesh outputs there too; b9edd9c570bd32dd came to 50 KB of Metal's 32 KB that way)
+            if (isStore && operation.StorageKind == StorageKind.SharedMemory && context.Properties.Mesh is { IsMesh: true } mesh && operation.SourcesCount == 3 &&
+                operation.GetSource(0) is AstOperand { Type: OperandType.Constant } memory && memory.Value == mesh.PlaneMemoryId)
+            {
+                SpvInstruction word = context.Get(AggregateType.U32, operation.GetSource(1));
+                SpvInstruction value = context.Get(AggregateType.U32, operation.GetSource(2));
+                context.FunctionCall(context.TypeVoid(), context.MeshPlaneStore, word, value);
+                return OperationResult.Invalid;
+            }
+
             SpvInstruction pointer = GetStoragePointer(context, operation, out AggregateType varType);
 
             if (isStore)
@@ -1844,7 +1855,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                     }
                     else
                     {
-                        storageClass = StorageClass.Workgroup;
+                        storageClass = Declarations.SharedStorageClass(StorageClass.Workgroup, context.Properties.SharedMemories[bindingId.Value]);
                         varType = context.Properties.SharedMemories[bindingId.Value].Type & AggregateType.ElementTypeMask;
                         baseObj = context.SharedMemories[bindingId.Value];
                     }

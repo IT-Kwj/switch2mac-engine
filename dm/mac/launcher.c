@@ -192,6 +192,9 @@ int main(int argc, char **argv) {
     if (shown == 2) saved_choices();
     cloud_saves_folder();
     setenv("DM_ROOT", sup, 0); setenv("DM_ROMFS", romfs, 0); setenv("DM_SAVE", save, 0); setenv("DM_TEMP", temp, 0);
+    // Shaders the game builds at run time (Switch 2 mesh / task programs among them) are not in its files: the host saves each one it has no library for into
+    // <Application Support folder>/shdump, which a rebuild takes in (switch2mac.py refresh). DM_NVN_SHDUMP in an env file or the launch environment names another folder
+    snprintf(p, sizeof p, "%s/shdump", sup); setenv("DM_NVN_SHDUMP", p, 0); mkdirs(getenv("DM_NVN_SHDUMP"));   // the host only writes files into it
     snprintf(p, sizeof p, "%s/msl", res); setenv("DM_MSL_DIR", p, 0);
     snprintf(p, sizeof p, "%s/font", dm); setenv("DM_FONT_DIR", p, 0);
     snprintf(p, sizeof p, "%s/shader_map.tsv", dm); if (!stat(p, &st)) setenv("DM_NVN_SHMAP", p, 0);

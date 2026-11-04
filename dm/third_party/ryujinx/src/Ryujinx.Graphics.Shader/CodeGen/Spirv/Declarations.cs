@@ -60,13 +60,20 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
         {
             foreach ((int id, MemoryDefinition memory) in memories)
             {
-                SpvInstruction pointerType = context.TypePointer(storage, context.GetType(memory.Type, memory.ArrayLength));
-                SpvInstruction variable = context.Variable(pointerType, storage);
+                StorageClass memoryStorage = SharedStorageClass(storage, memory);
+                SpvInstruction pointerType = context.TypePointer(memoryStorage, context.GetType(memory.Type, memory.ArrayLength));
+                SpvInstruction variable = context.Variable(pointerType, memoryStorage);
 
                 context.AddGlobalVariable(variable);
 
                 dict.Add(id, variable);
             }
+        }
+
+        // nxnative: a Switch 2 task program's memory (MeshShaderInfo) is the task payload the mesh workgroups it launches read
+        public static StorageClass SharedStorageClass(StorageClass storage, MemoryDefinition memory)
+        {
+            return storage == StorageClass.Workgroup && memory.Name == MeshShaderInfo.PayloadName ? StorageClass.TaskPayloadWorkgroupEXT : storage;
         }
 
         private static void DeclareConstantBuffers(CodeGenContext context, IEnumerable<BufferDefinition> buffers)

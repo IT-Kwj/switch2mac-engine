@@ -154,7 +154,10 @@ namespace Ryujinx.Graphics.Shader.Decoders
                                 succBlock.Predecessors.Add(currBlock);
                             }
 
-                            if (!IsUnconditionalBranch(ref lastOp))
+                            // A call returns to the next instruction: CAL has the Bra property (it ends the block) and is always unpredicated, but the code after it is still reached.
+                            // Without this edge the block after a CAL had no predecessor and was dropped, so the call fell through into whatever came next in memory (Mario Kart World
+                            // 1.0.0 2bd6823113ca65ed: "CAL sqrt slow path; BRA merge" lost its BRA, the fast path's rsqrt ran on 0 after the call, 0 x inf = NaN, the world lit white)
+                            if (!IsUnconditionalBranch(ref lastOp) || lastOp.Name == InstName.Cal)
                             {
                                 Block succBlock = GetBlock(currBlock.EndAddress);
                                 currBlock.Successors.Insert(0, succBlock);

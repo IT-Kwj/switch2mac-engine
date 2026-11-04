@@ -114,6 +114,15 @@ namespace Ryujinx.Graphics.Shader
         }
 
         /// <summary>
+        /// nxnative: the layout of a Switch 2 task / mesh program (TranslationFlags.TaskShader / MeshShader): max vertices, max primitives, task memory bytes,
+        /// then one entry per 0x80-scaled vertex plane: 0-3 position x y z w, 4 + 4 g + c generic attribute g component c (the SPH's written outputs in order).
+        /// </summary>
+        int[] QueryMeshShaderLayout()
+        {
+            return null;
+        }
+
+        /// <summary>
         /// Queries Constant Buffer usage information.
         /// </summary>
         /// <returns>A mask where each bit set indicates a bound constant buffer</returns>

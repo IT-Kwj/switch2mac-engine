@@ -107,6 +107,14 @@ static void probe_dump_once(void) {
     fwrite(m->base + strtoull(o, 0, 16), 1, strtoull(n, 0, 16), fp); fclose(fp);
     LOG("probe dump %s+%s length %s → %s", mod, o, n, f ? f : def);
 }
+// DM_CTL "probewin <frames>": the probes report from the current frame for that many frames (hit counts start again), e.g. while a flicker is on screen.
+// Start with DM_PROBE_FRAMES=0 so nothing is reported before
+void dm_probe_window(uint64_t n) {
+    uint64_t f = dm_guest_frame();
+    for (int i = 0; i < g_nprobe; i++) g_probe[i].hits = 0;
+    g_probe_frame_last = f + n; g_probe_frame_first = f;
+    LOG("probes report frames %llu-%llu", (unsigned long long)f, (unsigned long long)(f + n));
+}
 static int probe_hit(ucontext_t *uc) {   // Registered by probe_install with the SIGTRAP branch of crash.c
     uint64_t pc = uc->uc_mcontext->__ss.__pc;
     for (int i = 0; i < g_nprobe; i++) if (g_probe[i].at == pc) {
@@ -130,7 +138,7 @@ static int probe_hit(ucontext_t *uc) {   // Registered by probe_install with the
         for (int r = 0; r < 8; r++) { uint64_t v = uc->uc_mcontext->__ss.__x[r]; fprintf(stderr, " x%d=%#llx", r, v); probe_str(v); }
         for (int r = 19; r < 24; r++) fprintf(stderr, " x%d=%#llx", r, uc->uc_mcontext->__ss.__x[r]);
         if (getenv("DM_PROBE_ALL")) for (int r = 9; r < 19; r++) fprintf(stderr, " x%d=%#llx", r, uc->uc_mcontext->__ss.__x[r]);   // also print x9–x18
-        fprintf(stderr, " lr=%#llx", uc->uc_mcontext->__ss.__lr);
+        fprintf(stderr, " lr=%#llx fpcr=%#x", uc->uc_mcontext->__ss.__lr, uc->uc_mcontext->__ns.__fpcr);
         { uint64_t x8 = uc->uc_mcontext->__ss.__x[8]; Dl_info di; fprintf(stderr, " x8=%#llx", x8);   // x8: indirect call targets are often here (probe placed before blr x8)
           if (dladdr((void *)x8, &di) && di.dli_sname) fprintf(stderr, " (%s+%#lx)", di.dli_sname, (unsigned long)(x8 - (uint64_t)di.dli_saddr)); }
         if (g_probe[i].dump >= 0) {
@@ -156,6 +164,25 @@ static int probe_hit(ucontext_t *uc) {   // Registered by probe_install with the
     return 0;
 }
 static uint32_t *g_slots; static int g_slots_sealed;
+static unsigned g_mkw_w, g_mkw_h;
+#define MKW_RES_INSN 0x2d538660u   // ldp s0, s1, [x19, #0x9c]
+// DM_MKW_RES_ALL=1 also replaces every other 2560 / 1440 (u32 or float) in the config's first 0x400 bytes; each one found is logged either way
+static void mkw_res_fn(ucontext_t *uc) { uint8_t *b = (uint8_t *)uc->uc_mcontext->__ss.__x[19]; uint32_t *c = (uint32_t *)(b + 0x9c); int all = getenv("DM_MKW_RES_ALL") != NULL;
+    LOG("DM_MKW_RES: config size %ux%u → %ux%u", c[0], c[1], g_mkw_w, g_mkw_h); c[0] = g_mkw_w; c[1] = g_mkw_h;
+    for (int o = 0; o + 4 <= 0x400; o += 4) { uint32_t v; float f; memcpy(&v, b + o, 4); memcpy(&f, b + o, 4);
+        int k = v == 2560 ? 1 : v == 1440 ? 2 : f == 2560.0f ? 3 : f == 1440.0f ? 4 : 0; if (!k) continue;
+        LOG("DM_MKW_RES: config +%#x holds %s%s", o, k == 1 ? "2560" : k == 2 ? "1440" : k == 3 ? "2560.0" : "1440.0", all ? " (replaced)" : "");
+        if (!all) continue;
+        if (k == 1) v = g_mkw_w; else if (k == 2) v = g_mkw_h; else { f = k == 3 ? (float)g_mkw_w : (float)g_mkw_h; memcpy(&v, &f, 4); }
+        memcpy(b + o, &v, 4); } }
+// DM_MKW_RES with DM_MKW_RES_RT=1 (test): textures built from a description record (main+0x130204 ldrh w1, [x24, #2]: u16 width at +2, height at +4) that say 2560x1440
+// get W x H in the record itself, so the game sees the new size too; the first 8 are logged with their call chain either way (DM_MKW_RES_RT=0: log only)
+#define MKW_RT_INSN 0x79400701u
+static void mkw_rt_fn(ucontext_t *uc) { uint16_t *d = (uint16_t *)uc->uc_mcontext->__ss.__x[24]; static int n; static int on = -1;
+    if (d[1] != 2560 || d[2] != 1440) return;
+    if (on < 0) { const char *e = getenv("DM_MKW_RES_RT"); on = e && atoi(e); }
+    if (n++ < 8) { LOG("DM_MKW_RES: render target record %p 2560x1440%s", (void *)d, on ? " → replaced" : ""); dm_backtrace(uc->uc_mcontext->__ss.__fp); }
+    if (on) { d[1] = (uint16_t)g_mkw_w; d[2] = (uint16_t)g_mkw_h; } }
 static void probe_add(module_t *m, uint64_t off, long dump, probe_fn fn) {
     if (g_nprobe >= MAX_PROBE) die("too many probes");
     if (!g_slots) g_slots = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -371,6 +398,14 @@ void probe_install(void) {
     }
     const char *limit = getenv("DM_PROBE_LIMIT");
     if (limit) g_probe_limit = (unsigned)strtoul(limit, NULL, 10);
+    // DM_MKW_RES=WxH (test): Mario Kart World 1.0.0 reads its display size from its start-up config at main+0xcf3b9c (ldp s0, s1, [x19, #0x9c]: u32 width, height,
+    // 2560x1440 docked); the window, swap chain and render targets follow it. The hook writes W, H there first. Only when that instruction is in place
+    { const char *r = getenv("DM_MKW_RES"); module_t *m = NULL;
+      for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) m = &g_mod[i];
+      if (r && m && sscanf(r, "%ux%u", &g_mkw_w, &g_mkw_h) != 2) g_mkw_w = 0;
+      if (r && m && g_mkw_w && *(uint32_t *)(m->base + 0xcf3b9c) == MKW_RES_INSN) { probe_add(m, 0xcf3b9c, -1, mkw_res_fn); LOG("DM_MKW_RES: display size %ux%u", g_mkw_w, g_mkw_h);
+          if (getenv("DM_MKW_RES_RT") && *(uint32_t *)(m->base + 0x130204) == MKW_RT_INSN) probe_add(m, 0x130204, -1, mkw_rt_fn); }
+      else if (r) LOG("[RED] DM_MKW_RES=%s: not WxH or not Mario Kart World 1.0.0's main; ignored", r); }
     const char *e = getenv("DM_PROBE");
     if (e) {
         char spec[512]; strlcpy(spec, e, sizeof spec);

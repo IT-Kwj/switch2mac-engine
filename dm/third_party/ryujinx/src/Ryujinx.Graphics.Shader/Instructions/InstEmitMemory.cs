@@ -1,5 +1,6 @@
 using Ryujinx.Graphics.Shader.Decoders;
 using Ryujinx.Graphics.Shader.IntermediateRepresentation;
+using Ryujinx.Graphics.Shader.StructuredIr;
 using Ryujinx.Graphics.Shader.Translation;
 using System.Numerics;
 using static Ryujinx.Graphics.Shader.Instructions.InstEmitHelper;
@@ -127,6 +128,30 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
             InstLds op = context.GetOp<InstLds>();
 
+            if (MeshWindow(context, op.Imm24, out int window, out int windowOffset, out MeshShaderInfo mesh))
+            {
+                if (window == 1)   // the workgroup index
+                {
+                    Register d = new(op.Dest, RegisterType.Gpr);
+                    if (!d.IsRZ)
+                    {
+                        context.Copy(Register(d), context.Load(StorageKind.Input, IoVariable.CtaId, null, Const(0)));
+                    }
+
+                    return;
+                }
+
+                (int id, int mask) = mesh.Window(window);
+                if (id < 0)
+                {
+                    context.TranslatorContext.GpuAccessor.Log($"Stage memory window {window} has no memory in this stage.");
+                    return;
+                }
+
+                EmitLoad(context, StorageKind.SharedMemory, op.LsSize, GetSrcReg(context, op.SrcA), op.Dest, windowOffset, id, mask);
+                return;
+            }
+
             EmitLoad(context, StorageKind.SharedMemory, op.LsSize, GetSrcReg(context, op.SrcA), op.Dest, Imm24ToSInt(op.Imm24));
         }
 
@@ -163,7 +188,41 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
             InstSts op = context.GetOp<InstSts>();
 
+            if (MeshWindow(context, op.Imm24, out int window, out int windowOffset, out MeshShaderInfo mesh))
+            {
+                (int id, int mask) = mesh.Window(window);
+                if (id < 0 || window == 2)
+                {
+                    context.TranslatorContext.GpuAccessor.Log($"Stage memory window {window} cannot be written in this stage.");
+                    return;
+                }
+
+                EmitStore(context, StorageKind.SharedMemory, op.LsSize, GetSrcReg(context, op.SrcA), op.Dest, windowOffset, id, mask);
+                return;
+            }
+
             EmitStore(context, StorageKind.SharedMemory, op.LsSize, GetSrcReg(context, op.SrcA), op.Dest, Imm24ToSInt(op.Imm24));
+        }
+
+        // nxnative: a Switch 2 task / mesh program's stage memory (nx2_lower: shared memory at window << 20 | address, StructuredIr/MeshShaderInfo.cs)
+        private static bool MeshWindow(EmitterContext context, int imm24, out int window, out int offset, out MeshShaderInfo mesh)
+        {
+            TranslationFlags flags = context.TranslatorContext.Options.Flags;
+            bool task = flags.HasFlag(TranslationFlags.TaskShader);
+            window = imm24 >> 20;
+            offset = imm24 & 0xfffff;
+            mesh = null;
+
+            if ((!task && !flags.HasFlag(TranslationFlags.MeshShader)) || window == 0)
+            {
+                return false;
+            }
+
+            ShaderProperties properties = context.ResourceManager.Properties;
+            mesh = properties.Mesh ??= new MeshShaderInfo(task, context.TranslatorContext.GpuAccessor.QueryMeshShaderLayout());
+            mesh.Declare(properties);
+
+            return true;
         }
 
         private static Operand EmitLoadConstant(EmitterContext context, Operand slot, Operand offset)
@@ -311,7 +370,9 @@ namespace Ryujinx.Graphics.Shader.Instructions
             LsSize2 size,
             Operand srcA,
             int rd,
-            int offset)
+            int offset,
+            int memoryId = -1,
+            int byteMask = 0)
         {
             if (size > LsSize2.B128)
             {
@@ -319,7 +380,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 return;
             }
 
-            int id = storageKind == StorageKind.LocalMemory
+            int id = memoryId >= 0 ? memoryId : storageKind == StorageKind.LocalMemory
                 ? context.ResourceManager.LocalMemoryId
                 : context.ResourceManager.SharedMemoryId;
             bool isSmallInt = size < LsSize2.B32;
@@ -343,6 +404,15 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 }
 
                 Operand byteOffset = context.IAdd(baseOffset, Const(offset + index * 4));
+                if (byteMask > 0)
+                {
+                    byteOffset = context.BitwiseAnd(byteOffset, Const(byteMask));
+                }
+                else if (byteMask < 0)   // MeshShaderInfo.Window: clamped to the memory's last word
+                {
+                    byteOffset = context.IMinimumU32(byteOffset, Const(-byteMask));
+                }
+
                 Operand wordOffset = context.ShiftRightU32(byteOffset, Const(2)); // Word offset = byte offset / 4 (one word = 4 bytes).
                 Operand bitOffset = GetBitOffset(context, byteOffset);
                 Operand value = context.Load(storageKind, id, wordOffset);
@@ -392,7 +462,9 @@ namespace Ryujinx.Graphics.Shader.Instructions
             LsSize2 size,
             Operand srcA,
             int rd,
-            int offset)
+            int offset,
+            int memoryId = -1,
+            int byteMask = 0)
         {
             if (size > LsSize2.B128)
             {
@@ -400,7 +472,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 return;
             }
 
-            int id = storageKind == StorageKind.LocalMemory
+            int id = memoryId >= 0 ? memoryId : storageKind == StorageKind.LocalMemory
                 ? context.ResourceManager.LocalMemoryId
                 : context.ResourceManager.SharedMemoryId;
             bool isSmallInt = size < LsSize2.B32;
@@ -420,6 +492,15 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
                 Operand value = Register(isRz ? rd : rd + index, RegisterType.Gpr);
                 Operand byteOffset = context.IAdd(baseOffset, Const(offset + index * 4));
+                if (byteMask > 0)
+                {
+                    byteOffset = context.BitwiseAnd(byteOffset, Const(byteMask));
+                }
+                else if (byteMask < 0)   // MeshShaderInfo.Window: clamped to the memory's last word
+                {
+                    byteOffset = context.IMinimumU32(byteOffset, Const(-byteMask));
+                }
+
                 Operand wordOffset = context.ShiftRightU32(byteOffset, Const(2));
                 Operand bitOffset = GetBitOffset(context, byteOffset);
 

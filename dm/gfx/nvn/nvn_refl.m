@@ -90,7 +90,7 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
             else if ([k isEqualToString:@DMSH_KIND_GEOMETRY]) { if (reg < 0 || reg > 4) FAIL("invalid geometry helper slot"); r->kind = NVN_RB_GEOMETRY; }
             else if ([k isEqualToString:@DMSH_KIND_SUPPORT]) r->kind = NVN_RB_SUPPORT;
             else if ([k isEqualToString:@DMSH_KIND_C1]) r->kind = NVN_RB_C1;
-            else if ([k isEqualToString:@DMSH_KIND_DRVCB]) r->kind = [b[@"bank"] intValue] == 2 ? NVN_RB_DRV2 : NVN_RB_DRV0;
+            else if ([k isEqualToString:@DMSH_KIND_DRVCB]) r->kind = [b[@"bank"] intValue] == 2 ? NVN_RB_DRV2 : [b[@"bank"] intValue] == 17 ? NVN_RB_DRV17 : NVN_RB_DRV0;
             else if ([k isEqualToString:@DMSH_KIND_BORDER]) { if (o->border) FAIL("two border colour blocks"); r->kind = NVN_RB_BORDER; o->border = (uint8_t)(o->nb + 1); }
             else FAIL("B binding kind %s not implemented (%s)", k.UTF8String, [b[@"msl_name"] UTF8String]);
             id bb = b[@"border_bit"];   // a twin sampler (dmsh_build.py border_emu)
@@ -135,9 +135,10 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
             o->has_vin = used != 0;
         }
         NSDictionary *ra = j[@"raster"];
-        o->pos_attr = -1; o->may_discard = 1; o->writes_smask = 1;
+        o->pos_attr = -1; o->pos_aff_attr = -1; o->may_discard = 1; o->writes_smask = 1;
         if ([ra isKindOfClass:[NSDictionary class]]) {
             if (ra[@"pos_attr"]) { int pa = [ra[@"pos_attr"] intValue]; o->pos_attr = (int8_t)(pa >= 0 && pa < 16 ? pa : -1); o->pos_w1 = [ra[@"pos_w"] isEqual:@"one"]; }
+            NSArray *af = ra[@"pos_aff"]; if (ra[@"pos_aff_attr"] && [af isKindOfClass:[NSArray class]] && af.count == 5) { int pa = [ra[@"pos_aff_attr"] intValue]; o->pos_aff_attr = (int8_t)(pa >= 0 && pa < 16 ? pa : -1); for (int q = 0; q < 5; q++) o->pos_aff[q] = [af[q] floatValue]; }
             if (ra[@"discard"]) o->may_discard = [ra[@"discard"] intValue] != 0;
             if (ra[@"sample_mask"]) o->writes_smask = [ra[@"sample_mask"] intValue] != 0;
             for (NSNumber *c in ra[@"colors"]) if (c.intValue >= 0 && c.intValue < 8) o->color_mask |= (uint8_t)(1u << c.intValue);

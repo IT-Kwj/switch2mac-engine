@@ -1,10 +1,7 @@
 // Mac front end: with DM_WINDOW=1 open a window (CAMetalLayer, for the graphics backend to present frames) + keyboard and controllers → dm_input; the guest runs on a large-stack thread instead and the main thread belongs to AppKit.
 // Without DM_WINDOW: the guest runs directly on the current thread, behaving the same as with no front end (windowless tests use this).
 // The window is fullscreen-capable (the green button and ⌃⌘F); DM_FULLSCREEN=1 starts it that way. ⌘Q quits; the left mouse button is the touchscreen.
-// Cheats (hle_cheats.c): the Cheats menu's rows toggle, reload (⌘R) and open the cheats folder; its first item "Show Cheats
-// Window" (⌘⇧C, or DM_CHEATS_WINDOW=1 at launch) opens a Cheats panel beside the game: sections, search, the master switch,
-// safe mode, values, details and the import of cheat files (see the code below).
-// Key map (Nintendo layout): WASD left stick, arrow keys D-pad, J=A K=B U=X I=Y, Q=L E=R, Z=ZL C=ZR, F=press left stick G=press right stick, Return=+ Tab=−, Space=shake the controller.
+// Key map (Nintendo layout): 1 = performance overlay mode, 2 = settings panel, WASD left stick, arrow keys D-pad, J=A K=B U=X I=Y, Q=L E=R, Z=ZL C=ZR, F=press left stick G=press right stick, Return=+ Tab=−, Space=shake the controller.
 // Controllers: face buttons as on the iPhone, by position (right A, bottom B, top X, left Y) or on a Nintendo pad by its labels (pad_apple.h), shoulders L R, triggers ZL ZR, Menu + Options −, both sticks and their presses.
 // Each controller is a player of its own (local co-op): the first one connected is player 1, together with the keyboard, the next player 2, and so on up to 8 (pad_slots.h);
 // DM_PAD_MERGE=1 merges every controller into player 1 instead, DM_KBD_PLAYER=own makes the keyboard player 1 on its own, with the controllers from player 2 on.
@@ -23,7 +20,8 @@
 #include "pad_apple.h"
 #include <signal.h>
 #include <math.h>
-#include <sys/stat.h>
+#include <sys/resource.h>
+#include <mach/mach.h>
 
 static CAMetalLayer *g_layer;
 static uint64_t g_btn;
@@ -240,12 +238,202 @@ static void pads_start(void) {
 - (void)viewDidChangeBackingProperties { [super viewDidChangeBackingProperties]; [self fitDrawable]; }
 @end
 
-// AppKit reports a refused fullscreen request only to the window delegate (there is no notification for it)
-static void (^g_fs_failed)(void);
-@interface DmWinDelegate : NSObject <NSWindowDelegate> @end
-@implementation DmWinDelegate
-- (void)windowDidFailToEnterFullScreen:(NSWindow *)w { (void)w; if (g_fs_failed) g_fs_failed(); }
+// Performance overlay: a small box in the window's top-right corner, refreshed twice a second. Key 1 cycles it: compact (frame rate + the game's resolution) → detailed (the frame-rate
+// graph, frame time, GPU, CPU, memory, the game's pacing, the window's output size) → off → compact. DM_OVERLAY=compact | detailed | off picks the mode at start (default compact; the settings window writes it)
+uint64_t mtl_cur_frame(void); double mtl_gpu_ms(uint64_t f); int nvn_game_fps(void); void nvn_game_size(int *w, int *h);
+#define OV_N 60   // graph samples: 30 s
+static int g_ov_mode = 1;   // 0 off, 1 compact, 2 detailed
+@interface DmOverlay : NSView
+@property(strong) NSTextField *label;
 @end
+@implementation DmOverlay {
+    float _fps[OV_N]; int _n; uint64_t _f0; double _t0, _cpu0; NSString *_lines; double _fpsNow, _gpu;
+}
+- (instancetype)initWithFrame:(NSRect)r {
+    if (!(self = [super initWithFrame:r])) return nil;
+    self.wantsLayer = YES; self.layer.backgroundColor = [NSColor colorWithWhite:0.04 alpha:0.72].CGColor; self.layer.cornerRadius = 7;
+    self.layer.borderWidth = 1; self.layer.borderColor = [NSColor colorWithWhite:1 alpha:0.14].CGColor;
+    self.label = [NSTextField labelWithString:@""]; self.label.maximumNumberOfLines = 0; [self addSubview:self.label];
+    _t0 = CACurrentMediaTime(); _f0 = mtl_cur_frame(); _gpu = -1;
+    __weak DmOverlay *w = self; [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) { (void)t; [w tick]; }];
+    return self;
+}
+- (NSView *)hitTest:(NSPoint)p { (void)p; return nil; }   // clicks go through to the game (the touchscreen)
+static double cpu_seconds(void) { struct rusage u; getrusage(RUSAGE_SELF, &u); return u.ru_utime.tv_sec + u.ru_stime.tv_sec + (u.ru_utime.tv_usec + u.ru_stime.tv_usec) / 1e6; }
+static double footprint_gb(void) { task_vm_info_data_t vi; mach_msg_type_number_t n = TASK_VM_INFO_COUNT; return task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &n) == KERN_SUCCESS ? vi.phys_footprint / 1073741824.0 : 0; }
+- (void)tick {
+    double t = CACurrentMediaTime(), dt = t - _t0, cpu = cpu_seconds(); uint64_t f = mtl_cur_frame();
+    if (dt <= 0) return;
+    _fpsNow = f >= _f0 ? (f - _f0) / dt : 0;
+    double g = 0; int gn = 0;   // GPU busy time per frame: the frames of the last half second that have completed
+    for (uint64_t k = f > 3 ? f - 3 : 0; k > _f0 && gn < 30; k--) { double v = mtl_gpu_ms(k); if (v >= 0) { g += v; gn++; } }
+    if (gn) _gpu = g / gn;
+    double cpuPct = _cpu0 > 0 ? (cpu - _cpu0) / dt * 100 : 0;
+    _t0 = t; _f0 = f; _cpu0 = cpu;
+    if (_n < OV_N) _fps[_n++] = (float)_fpsNow; else { memmove(_fps, _fps + 1, (OV_N - 1) * sizeof *_fps); _fps[OV_N - 1] = (float)_fpsNow; }
+    [self refreshWithCPU:cpuPct];
+}
+- (void)refreshWithCPU:(double)cpuPct {
+    self.hidden = g_ov_mode == 0; if (!g_ov_mode) return;
+    NSFont *mono = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightMedium];
+    NSColor *green = [NSColor colorWithCalibratedRed:80/255.0 green:1 blue:120/255.0 alpha:1], *yellow = [NSColor colorWithCalibratedRed:1 green:230/255.0 blue:40/255.0 alpha:1],
+            *red = [NSColor colorWithCalibratedRed:1 green:90/255.0 blue:80/255.0 alpha:1], *grey = [NSColor colorWithWhite:0.72 alpha:1];
+    NSColor *fc = _fpsNow >= 55 ? green : _fpsNow >= 30 ? yellow : red;
+    NSMutableAttributedString *a = [NSMutableAttributedString new];
+    void (^line)(NSString *, NSColor *) = ^(NSString *s, NSColor *c) { [a appendAttributedString:[[NSAttributedString alloc] initWithString:s attributes:@{NSFontAttributeName: mono, NSForegroundColorAttributeName: c}]]; };
+    NSString *gpu = _gpu >= 0 ? [NSString stringWithFormat:@"%.1f ms", _gpu] : @"--";
+    int gw0, gh0; nvn_game_size(&gw0, &gh0);
+    line([NSString stringWithFormat:@"FPS %.0f", _fpsNow], fc);
+    line(gw0 > 0 ? [NSString stringWithFormat:@"\n%dx%d", gw0, gh0] : @"\n--", green);
+    if (g_ov_mode == 2) {
+        line([NSString stringWithFormat:@"\nGPU %@", gpu], _gpu > 16.7 ? yellow : green);
+        line([NSString stringWithFormat:@"\nFrame %.1f ms", _fpsNow > 0 ? 1000 / _fpsNow : 0], green);
+        line([NSString stringWithFormat:@"\nCPU %.0f%%", cpuPct], green);
+        double mem = footprint_gb(); line([NSString stringWithFormat:@"\nMemory %.1f GB", mem], mem > 16 ? yellow : green);
+        line([NSString stringWithFormat:@"\nGame pacing %d fps", nvn_game_fps()], grey);
+        NSSize px = g_layer.drawableSize; line([NSString stringWithFormat:@"\nOutput %.0fx%.0f", px.width, px.height], grey);
+    }
+    line(g_ov_mode == 2 ? @"\n1: hide · 2: settings" : @"\n1: more · 2: settings", grey);
+    self.label.attributedStringValue = a;
+    NSSize z = [self.label sizeThatFits:NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX)];
+    CGFloat gw = g_ov_mode == 2 ? 220 : 0, gh = g_ov_mode == 2 ? 74 : 0, cw = fmax(ceil(z.width), gw), m = 10;
+    CGFloat w = cw + 16, h = ceil(z.height) + gh + 10; NSSize b = self.superview.bounds.size;
+    self.frame = NSMakeRect(floor(b.width - w - m), floor(b.height - h - m), w, h);
+    self.label.frame = NSMakeRect(8, gh + 5, ceil(z.width), ceil(z.height));
+    [self setNeedsDisplay:YES];
+}
+- (void)drawRect:(NSRect)d {   // detailed mode: the frame rate of the last 30 s, with lines at 30 and 60
+    (void)d; if (g_ov_mode != 2 || !_n) return;
+    float lo = _fps[0], hi = _fps[0]; for (int i = 0; i < _n; i++) { lo = fminf(lo, _fps[i]); hi = fmaxf(hi, _fps[i]); }
+    NSDictionary *st = @{NSFontAttributeName: [NSFont monospacedSystemFontOfSize:9 weight:NSFontWeightMedium], NSForegroundColorAttributeName: [NSColor colorWithWhite:0.88 alpha:1]};
+    [[NSString stringWithFormat:@"min %.0f   max %.0f   (30 s)", lo, hi] drawAtPoint:NSMakePoint(8, 60) withAttributes:st];
+    NSRect p = NSMakeRect(30, 8, self.bounds.size.width - 38, 46); double top = fmax(60, ceil(hi * 1.1 / 30) * 30);
+    NSDictionary *ax = @{NSFontAttributeName: [NSFont monospacedSystemFontOfSize:8 weight:NSFontWeightRegular], NSForegroundColorAttributeName: [NSColor colorWithWhite:0.75 alpha:0.8]};
+    for (int v = 30; v <= 60; v += 30) {
+        CGFloat y = NSMinY(p) + v / top * p.size.height;
+        NSBezierPath *g = [NSBezierPath bezierPath]; [g moveToPoint:NSMakePoint(NSMinX(p), y)]; [g lineToPoint:NSMakePoint(NSMaxX(p), y)];
+        [[NSColor colorWithWhite:0.75 alpha:0.2] setStroke]; [g stroke];
+        [[NSString stringWithFormat:@"%d", v] drawAtPoint:NSMakePoint(8, y - 5) withAttributes:ax];
+    }
+    NSBezierPath *c = [NSBezierPath bezierPath]; c.lineWidth = 1.5;
+    for (int i = 0; i < _n; i++) {
+        NSPoint q = NSMakePoint(NSMinX(p) + (OV_N > 1 ? (CGFloat)(OV_N - _n + i) / (OV_N - 1) : 0) * p.size.width, NSMinY(p) + fmin(_fps[i] / top, 1) * p.size.height);
+        if (i) [c lineToPoint:q]; else [c moveToPoint:q];
+    }
+    [[NSColor colorWithCalibratedRed:80/255.0 green:1 blue:120/255.0 alpha:1] setStroke]; [c stroke];
+}
+@end
+// Settings panel (key 2, Esc closes): the app's settings list (Resources/dm/launcher.json, the same rows the launcher window has) over the game, dark cards as in the launcher.
+// A change is saved where the launcher reads it (launcher.<VAR> in the app's preferences, removed at the default) for the next start; the overlay and fullscreen apply at once.
+// While it is open the keyboard and mouse do not reach the game
+static NSUserDefaults *settings_store(void) {
+    NSString *bid = NSBundle.mainBundle.bundleIdentifier ?: @"";
+    return [bid hasPrefix:@"org.nxnative."] ? NSUserDefaults.standardUserDefaults : nil;   // the host inside the app: its bundle's domain, as the launcher's
+}
+static NSColor *ui_accent(void) { return [NSColor colorWithCalibratedRed:80/255.0 green:1 blue:120/255.0 alpha:1]; }
+@interface DmPanelRow : NSObject
+@property(copy) NSDictionary *s; @property(strong) NSTextField *note;
+@end
+@implementation DmPanelRow @end
+@interface DmPanel : NSView
+@property(strong) NSMutableArray<DmPanelRow *> *rows;
+@end
+static DmPanel *g_panel;
+static void overlay_set(int mode);
+@implementation DmPanel
+static NSTextField *panel_label(NSString *t, CGFloat size, NSFontWeight w, NSColor *c) {
+    NSTextField *l = [NSTextField wrappingLabelWithString:t]; l.font = [NSFont systemFontOfSize:size weight:w]; l.textColor = c; l.drawsBackground = NO; return l;
+}
+static NSString *setting_value(NSDictionary *s) {
+    const char *e = getenv([s[@"env"] UTF8String]); return e ? @(e) : s[@"default"];
+}
+- (instancetype)initWithFrame:(NSRect)r {
+    if (!(self = [super initWithFrame:r])) return nil;
+    self.wantsLayer = YES; self.layer.backgroundColor = [NSColor colorWithWhite:0.07 alpha:0.94].CGColor; self.layer.cornerRadius = 12;
+    self.layer.borderWidth = 1; self.layer.borderColor = [NSColor colorWithWhite:1 alpha:0.14].CGColor;
+    self.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+    self.rows = [NSMutableArray array];
+    const char *fd = getenv("DM_FONT_DIR"); NSArray *list = nil;
+    if (fd) { NSData *d = [NSData dataWithContentsOfFile:[[@(fd) stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"launcher.json"]];
+              if (d) list = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil][@"settings"]; }
+    NSStackView *st = [NSStackView stackViewWithViews:@[]]; st.orientation = NSUserInterfaceLayoutOrientationVertical; st.alignment = NSLayoutAttributeLeading; st.spacing = 8;
+    st.edgeInsets = NSEdgeInsetsMake(18, 20, 18, 20);
+    NSTextField *title = panel_label(@"Settings", 20, NSFontWeightBold, NSColor.whiteColor);
+    NSTextField *sub = panel_label(@"2 or Esc closes · the overlay and display mode change at once, the rest at the next launch", 11, NSFontWeightMedium, ui_accent());
+    [st addArrangedSubview:title]; [st addArrangedSubview:sub];
+    NSString *sec = nil;
+    for (NSDictionary *s in list) {
+        NSString *sc = [s[@"section"] isEqual:@"Game"] ? @"DISPLAY" : [s[@"section"] uppercaseString];
+        if (![sc isEqual:sec]) { sec = sc; NSTextField *h = panel_label(sc, 11, NSFontWeightBold, [NSColor colorWithWhite:0.6 alpha:1]); [st addArrangedSubview:h]; [st setCustomSpacing:4 afterView:h]; }
+        [st addArrangedSubview:[self card:s]];
+    }
+    if (!list.count) [st addArrangedSubview:panel_label(@"No settings list in this app (Resources/dm/launcher.json).", 12, NSFontWeightRegular, NSColor.whiteColor)];
+    NSScrollView *sv = [[NSScrollView alloc] initWithFrame:self.bounds]; sv.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    sv.drawsBackground = NO; sv.hasVerticalScroller = YES;
+    NSView *doc = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, r.size.width, 10)]; [doc addSubview:st]; st.translatesAutoresizingMaskIntoConstraints = NO;
+    [NSLayoutConstraint activateConstraints:@[[st.leadingAnchor constraintEqualToAnchor:doc.leadingAnchor], [st.trailingAnchor constraintEqualToAnchor:doc.trailingAnchor], [st.topAnchor constraintEqualToAnchor:doc.topAnchor]]];
+    doc.frame = NSMakeRect(0, 0, r.size.width - 16, st.fittingSize.height); sv.documentView = doc; [self addSubview:sv];
+    [doc scrollPoint:NSMakePoint(0, doc.isFlipped ? 0 : doc.bounds.size.height)];
+    return self;
+}
+- (BOOL)isFlipped { return YES; }
+- (NSView *)card:(NSDictionary *)s {
+    NSView *c = [NSView new]; c.wantsLayer = YES; c.layer.backgroundColor = [NSColor colorWithWhite:1 alpha:0.06].CGColor; c.layer.cornerRadius = 9;
+    c.layer.borderWidth = 1; c.layer.borderColor = [NSColor colorWithWhite:1 alpha:0.12].CGColor; c.translatesAutoresizingMaskIntoConstraints = NO;
+    NSTextField *l = panel_label(s[@"label"], 13, NSFontWeightSemibold, NSColor.whiteColor);
+    DmPanelRow *row = [DmPanelRow new]; row.s = s; [self.rows addObject:row];
+    NSString *v = setting_value(s); NSControl *ctl;
+    if ([s[@"kind"] isEqual:@"choice"]) {
+        NSPopUpButton *p = [NSPopUpButton new]; for (NSArray *o in s[@"options"]) { [p addItemWithTitle:o[1]]; p.lastItem.representedObject = o[0]; if ([o[0] isEqual:v]) [p selectItem:p.lastItem]; }
+        ctl = p;
+    } else if ([s[@"kind"] isEqual:@"range"]) {
+        NSSlider *sl = [NSSlider sliderWithValue:v.doubleValue minValue:[s[@"min"] doubleValue] maxValue:[s[@"max"] doubleValue] target:nil action:nil]; sl.continuous = NO;
+        [sl.widthAnchor constraintEqualToConstant:150].active = YES; ctl = sl;
+    } else { NSSwitch *w = [NSSwitch new]; w.state = [v isEqual:s[@"on"] ?: @"1"] ? NSControlStateValueOn : NSControlStateValueOff; ctl = w; }
+    ctl.target = self; ctl.action = @selector(changed:); ctl.tag = (NSInteger)self.rows.count - 1;
+    NSString *n = s[@"note"]; row.note = panel_label(n ?: @"", 11, NSFontWeightRegular, [NSColor colorWithWhite:0.65 alpha:1]); row.note.hidden = !n.length;
+    for (NSView *x in @[l, row.note, ctl]) { x.translatesAutoresizingMaskIntoConstraints = NO; [c addSubview:x]; }
+    [NSLayoutConstraint activateConstraints:@[
+        [c.widthAnchor constraintEqualToConstant:self.bounds.size.width - 56],
+        [l.leadingAnchor constraintEqualToAnchor:c.leadingAnchor constant:12], [l.topAnchor constraintEqualToAnchor:c.topAnchor constant:9],
+        [l.trailingAnchor constraintLessThanOrEqualToAnchor:ctl.leadingAnchor constant:-10],
+        [row.note.leadingAnchor constraintEqualToAnchor:l.leadingAnchor], [row.note.topAnchor constraintEqualToAnchor:l.bottomAnchor constant:2],
+        [row.note.trailingAnchor constraintLessThanOrEqualToAnchor:ctl.leadingAnchor constant:-10],
+        [row.note.bottomAnchor constraintEqualToAnchor:c.bottomAnchor constant:-9],
+        [ctl.trailingAnchor constraintEqualToAnchor:c.trailingAnchor constant:-12], [ctl.centerYAnchor constraintEqualToAnchor:c.centerYAnchor]]];
+    [row.note setContentCompressionResistancePriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationVertical];
+    return c;
+}
+- (void)changed:(NSControl *)ctl {
+    NSDictionary *s = self.rows[(NSUInteger)ctl.tag].s; NSString *v;
+    if ([ctl isKindOfClass:NSPopUpButton.class]) v = ((NSPopUpButton *)ctl).selectedItem.representedObject;
+    else if ([ctl isKindOfClass:NSSlider.class]) v = [NSString stringWithFormat:@"%.2f", ctl.doubleValue];
+    else v = ((NSSwitch *)ctl).state == NSControlStateValueOn ? (s[@"on"] ?: @"1") : (s[@"off"] ?: @"0");
+    NSString *env = s[@"env"]; NSUserDefaults *u = settings_store(); NSString *key = [@"launcher." stringByAppendingString:env];
+    if ([v isEqual:s[@"default"]]) [u removeObjectForKey:key]; else [u setObject:v forKey:key];
+    LOG("front end: setting %s = %s (%s)", env.UTF8String, v.UTF8String, u ? "saved for the next launch" : "not saved: no app preferences");
+    if ([env isEqual:@"DM_OVERLAY"]) overlay_set([v isEqual:@"off"] ? 0 : [v isEqual:@"detailed"] ? 2 : 1);
+    if ([env isEqual:@"DM_FULLSCREEN"] && ([v isEqual:@"1"] != ((g_win.styleMask & NSWindowStyleMaskFullScreen) != 0))) [g_win toggleFullScreen:nil];
+}
+- (void)mouseDown:(NSEvent *)e { (void)e; }   // clicks on the panel's background do not reach the game
+@end
+static void panel_toggle(void) {
+    NSView *cv = g_win.contentView;
+    if (g_panel) { [g_panel removeFromSuperview]; g_panel = nil; input_resume(); LOG("front end: settings panel closed"); return; }
+    input_release();
+    CGFloat w = fmin(500, cv.bounds.size.width - 40), h = fmin(560, cv.bounds.size.height - 40);
+    g_panel = [[DmPanel alloc] initWithFrame:NSMakeRect(floor((cv.bounds.size.width - w) / 2), floor((cv.bounds.size.height - h) / 2), w, h)];
+    g_panel.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin | NSViewMaxYMargin;
+    [cv addSubview:g_panel positioned:NSWindowAbove relativeTo:nil]; LOG("front end: settings panel open (key 2)");
+}
+
+static DmOverlay *g_ov;
+static void overlay_set(int mode) { g_ov_mode = mode; [g_ov refreshWithCPU:0]; }
+static void overlay_cycle(void) {
+    g_ov_mode = g_ov_mode == 1 ? 2 : g_ov_mode == 2 ? 0 : 1;
+    LOG("front end: overlay %s (key 1)", g_ov_mode == 0 ? "off" : g_ov_mode == 1 ? "compact" : "detailed");
+    [g_ov refreshWithCPU:0];
+}
 
 typedef struct { void (*fn)(void); } guest_arg;
 static void *guest_tramp(void *p) {
@@ -256,852 +444,6 @@ static void *guest_tramp(void *p) {
 
 // Metal reads MTL_HUD_ENABLED when the process makes its first device, which can be before the window: set from DM_METAL_HUD before main (set in front_run, the HUD did not show)
 __attribute__((constructor)) static void hud_env(void) { front_hud_env(); }
-
-// ---------- Cheats: the menu and the panel (hle_cheats.c holds every state; these only show it and call it) ----------
-
-// A string of the engine as an NSString that is never nil: cheat names, sections and notes come from the player's files,
-// which may be Shift-JIS or Latin-1, and a UTF-8 name cut at the engine's buffer size may end in half a character. UTF-8
-// first, then UTF-8 without up to three trailing bytes, then Shift-JIS, then Windows-1252 (which decodes any byte)
-static NSString *engine_str(const char *s) {
-    if (!s) return @"";
-    size_t n = strlen(s);
-    for (size_t cut = 0; cut <= 3 && cut <= n; cut++) {
-        NSString *u = [[NSString alloc] initWithBytes:s length:n - cut encoding:NSUTF8StringEncoding];
-        if (u) return u;
-    }
-    return [[NSString alloc] initWithBytes:s length:n encoding:NSShiftJISStringEncoding]
-        ?: [[NSString alloc] initWithBytes:s length:n encoding:NSWindowsCP1252StringEncoding] ?: @"";
-}
-
-// A path quoted for the shell (single quotes; a quote inside becomes '\'')
-static NSString *shell_quote(NSString *p) { return [NSString stringWithFormat:@"'%@'", [p stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"]]; }
-
-// The name a row shows: the on half of an on / off pair loses its " - on" (the pair is one switch, its off half has no row)
-static NSString *cheat_display_name(int i) {
-    NSString *n = engine_str(dm_cheat_name_at(i));
-    if (!(dm_cheat_flags_at(i) & DM_CHEAT_PAIR_ON)) return n;
-    static NSRegularExpression *re;
-    if (!re) re = [NSRegularExpression regularExpressionWithPattern:@"(\\s*[-:_]\\s*|\\s+|\\s*[(\\[]\\s*)on\\s*[)\\]]?\\s*$" options:NSRegularExpressionCaseInsensitive error:nil];
-    NSString *base = [re stringByReplacingMatchesInString:n options:0 range:NSMakeRange(0, n.length) withTemplate:@""];
-    return base.length ? base : n;
-}
-
-// Does entry i get a row of its own? Not the off half of a pair (its on half is the switch) and not a section marker
-// (the section shows as a header above its entries)
-static BOOL cheat_has_row(int i) {
-    int f = dm_cheat_flags_at(i);
-    return !(f & (DM_CHEAT_PAIR_OFF | DM_CHEAT_SECTION_START | DM_CHEAT_SECTION_END));
-}
-
-// The row's whole title, the same string the menu's row carries: the name, plus the run-time reason when there is one,
-// "— master code (always on)" for a master code, "(nxnative only)" for a cheat this host runs itself (never-decrease)
-static NSString *cheat_row_title(int i) {
-    const char *why = dm_cheat_why_at(i);
-    int kind = dm_cheat_kind_at(i), f = dm_cheat_flags_at(i);
-    NSString *n = cheat_display_name(i);
-    if (kind == 1) return [n stringByAppendingString:@" — master code (always on)"];
-    if (why && *why) return [n stringByAppendingString:engine_str(why)];
-    if (f & DM_CHEAT_HOST) return [n stringByAppendingString:@" (nxnative only)"];
-    return n;
-}
-
-// The row's tooltip: the title, the meta file's note (how scripts/cheat_anchor.py compiled it), what a host-only or a
-// one-pass cheat does
-static NSString *cheat_row_tip(int i) {
-    NSMutableString *t = [cheat_row_title(i) mutableCopy];
-    int f = dm_cheat_flags_at(i);
-    const char *note = dm_cheat_note_at(i);
-    if (note && *note) [t appendFormat:@"\n%@", engine_str(note)];
-    if (f & DM_CHEAT_HOST) [t appendString:@"\nRun by nxnative itself: it keeps the highest value seen since it was turned on; other engines see an empty entry."];
-    if (f & DM_CHEAT_ONCE) [t appendString:@"\nApplied once: it writes one pass, then turns itself off."];
-    if (f & DM_CHEAT_PAIR_ON) [t appendString:@"\nSwitching it off puts the game's original code back."];
-    if (f & DM_CHEAT_WEAK) [t appendString:@"\nResolved weakly for this build: check its effect."];
-    return t;
-}
-
-// The row's state as hle_cheats.c has it: a plain cheat carries its own on state, a master code is always on, and a
-// disabled row (unsupported opcode, malformed, or killed at run time) or a label is off, its checkbox not clickable
-static NSControlStateValue cheat_row_state(int i) {
-    int kind = dm_cheat_kind_at(i);
-    return kind == 1 || (kind == 0 && dm_cheat_on_at(i)) ? NSControlStateValueOn : NSControlStateValueOff;
-}
-
-// A build's name for a player: "1.0.3 (build E1D8B399B787AE41)", or the build ID alone when its version is unknown
-static NSString *build_label(const char *bid, const char *ver) {
-    return ver && *ver ? [NSString stringWithFormat:@"%@ (build %@)", engine_str(ver), engine_str(bid)] : [NSString stringWithFormat:@"build %@", engine_str(bid)];
-}
-
-// "Open cheats folder": the menu's and the panel's action, one helper — create the folder when missing, then reveal it in Finder
-static void cheats_open_folder(void) {
-    const char *dir = dm_cheats_dir_path();
-    if (dir && *dir) { mkdir(dir, 0755); [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:@(dir)]]; }
-}
-
-// The Cheats panel (the menu's "Show Cheats Window", ⌘⇧C, or DM_CHEATS_WINDOW=1 at launch): a utility NSPanel that stays
-// open beside the game window, toggles applied live, scrollable. It never takes the key window from the game for a click
-// (becomesKeyOnlyIfNeeded, shown with orderFront), so the game keeps the keyboard and the controllers; it becomes key only
-// while the player types in its search field or a value field, and Return or Escape there hands the keyboard back.
-// Created once lazily and kept for the process's lifetime, closed only to hide (its place and size survive in the frame
-// autosave "DmCheatsPanel"). Every row comes from the C API (dm_cheat* in dm.h); the class holds no cheats state of its own
-// beyond the controls. Top to bottom:
-//   - the header (game build and version, counts) and, when it applies, a line about safe mode with Restore;
-//   - Cheats On (the master switch), Select All / Deselect All and the search field;
-//   - the rows: section headers, labels, one row per cheat (an on / off pair is one row; a "set" cheat has an Apply button
-//     instead of a checkbox; an "ask" cheat a value field; ⓘ shows its details), then the cheats the compiler left out,
-//     the other builds' files, and the anchored sources not compiled for this build;
-//   - a details line (a cheat's dry run and note, or the load report);
-//   - Reload, Open folder, Find Cheats… (in Ryujinx, the yuzu family and SD cards) and Report.
-// A .txt or a .cheats.toml dropped on the panel is copied into the cheats folder (import below; the drop works from a
-// background Finder window, see DmCheatsDropView). The rows are rebuilt
-// when what they were built from changes (a reload, the search text), updated in place otherwise; a ~1 s timer runs only
-// while the panel is visible
-@interface DmCheatsPanel : NSObject <NSWindowDelegate, NSTextFieldDelegate, NSSearchFieldDelegate>
-- (void)show;      // create the panel if needed, order it front (not key) and refresh
-- (void)refresh;   // the one refresh for every trigger: shown, a click, Reload, a Cheats-menu toggle, the 1 s timer
-- (BOOL)importFiles:(NSArray<NSURL *> *)urls;   // copy dropped / found cheat files into the cheats folder, reload
-@end
-static DmCheatsPanel *g_cheats_panel;   // created on the first Show Cheats Window, kept for the process's lifetime
-
-// The panel class: a panel may become key (its search and value fields need the keyboard); becomesKeyOnlyIfNeeded keeps a
-// checkbox click from making it key
-@interface DmCheatsNSPanel : NSPanel @end
-@implementation DmCheatsNSPanel
-- (BOOL)canBecomeKeyWindow { return YES; }
-@end
-
-// The panel's content view: it takes dropped files (a .txt or .cheats.toml) for the import. The utility panel hides while
-// another app is in front, so a drop works from a Finder window dragged without activating Finder first (a background
-// window), not after clicking into Finder; Find Cheats… covers the usual places without a drag
-@interface DmCheatsDropView : NSView @end
-@implementation DmCheatsDropView
-// A drag enters: accept it as a copy when it carries a cheat file
-- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)info {
-    NSArray *urls = [info.draggingPasteboard readObjectsForClasses:@[NSURL.class] options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
-    for (NSURL *u in urls) {
-        NSString *e = u.lastPathComponent.lowercaseString;
-        if ([e hasSuffix:@".txt"] || [e hasSuffix:@".cheats.toml"]) return NSDragOperationCopy;
-    }
-    return NSDragOperationNone;
-}
-// The drop: the import runs a main-queue turn later, so its questions (modal alerts) do not hold Finder's drag session open
-- (BOOL)performDragOperation:(id<NSDraggingInfo>)info {
-    NSArray *urls = [info.draggingPasteboard readObjectsForClasses:@[NSURL.class] options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
-    if (!urls.count || !g_cheats_panel) return NO;
-    dispatch_async(dispatch_get_main_queue(), ^{ [g_cheats_panel importFiles:urls]; });
-    return YES;
-}
-@end
-
-// The scroll view's document view: flipped, so the stack view's rows start at the top and the scroll position counts
-// downward like the rows (unflipped, everything would sit at the bottom of the document view)
-@interface DmCheatsDocView : NSView @end
-@implementation DmCheatsDocView
-- (BOOL)isFlipped { return YES; }
-@end
-
-// The Cheats menu of the game window (hle_cheats.c's rows, only meaningful with a window): rebuilt on every open, so the
-// loaded file's state, the menu's toggles and the cheats the VM disabled at run time are what the player sees. Rows: Show
-// Cheats Window (⌘⇧C), Cheats On (the master switch) and, in safe mode, Restore Saved Cheats; then the panel's rows in
-// short (section headers, labels, one row per cheat, a pair as one row, "set" cheats applied on click), the other builds'
-// files when none of this build is loaded, and Reload cheats (⌘R) / Open cheats folder. A click here also refreshes the
-// panel when one exists, so the two never disagree
-@interface DmCheatsMenuDelegate : NSObject <NSMenuDelegate>
-@end
-@implementation DmCheatsMenuDelegate
-// Rebuild the menu's rows from the engine (every open, and once at launch so its key equivalents exist)
-- (void)menuNeedsUpdate:(NSMenu *)menu {
-    [menu removeAllItems];
-    NSMenuItem *sh = [menu addItemWithTitle:@"Show Cheats Window" action:@selector(showPanel:) keyEquivalent:@"c"];
-    sh.target = self;
-    sh.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;   // ⌘⇧C (the plain "c" already maps ZR)
-    NSMenuItem *ms = [menu addItemWithTitle:@"Cheats On" action:@selector(toggleMaster:) keyEquivalent:@""];
-    ms.target = self; ms.state = dm_cheats_master() ? NSControlStateValueOn : NSControlStateValueOff;
-    if (dm_cheats_safe()) [menu addItemWithTitle:@"Restore Saved Cheats (safe mode)" action:@selector(restoreSafe:) keyEquivalent:@""].target = self;
-    [menu addItem:NSMenuItem.separatorItem];
-    const char *sec = "";
-    for (int i = 0, n = dm_cheats_ncheats(); i < n; i++) {
-        if (!cheat_has_row(i)) continue;
-        const char *s = dm_cheat_section_at(i);
-        if (strcmp(s, sec)) {   // a section header before its first entry
-            sec = s;
-            if (*s) [menu addItemWithTitle:[NSString stringWithFormat:@"— %@ —", engine_str(s)] action:nil keyEquivalent:@""].enabled = NO;
-        }
-        int kind = dm_cheat_kind_at(i), f = dm_cheat_flags_at(i);
-        NSString *title = cheat_row_title(i);
-        if (f & DM_CHEAT_ONCE) title = [title stringByAppendingString:@" (apply once)"];
-        NSMenuItem *it = [menu addItemWithTitle:title action:nil keyEquivalent:@""];
-        if (kind == 0) { it.target = self; it.action = @selector(toggleCheat:); it.tag = i; }
-        it.enabled = kind == 0;
-        it.state = cheat_row_state(i);
-        it.toolTip = cheat_row_tip(i);
-    }
-    for (int i = 0, n = dm_cheats_nothers(); i < n; i++)   // .txt files of other builds, lightly disabled (the brief's wording)
-        [menu addItemWithTitle:[NSString stringWithFormat:@"Cheats for %@ (another version of the game)", build_label(dm_cheats_other(i), dm_cheats_other_version(i))] action:nil keyEquivalent:@""].enabled = NO;
-    if (!dm_cheats_found())
-        [menu addItemWithTitle:[NSString stringWithFormat:@"No cheats for %@", build_label(dm_cheats_build(), dm_cheats_version())] action:nil keyEquivalent:@""].enabled = NO;
-    [menu addItem:[NSMenuItem separatorItem]];
-    NSMenuItem *re = [menu addItemWithTitle:@"Reload cheats" action:@selector(reloadCheats:) keyEquivalent:@"r"];
-    re.target = self;
-    const char *dir = dm_cheats_dir_path();
-    NSMenuItem *op = [menu addItemWithTitle:@"Open cheats folder" action:dir && *dir ? @selector(openCheatsFolder:) : nil keyEquivalent:@""];
-    op.target = self;
-    op.enabled = dir && *dir != 0;
-}
-// A cheat row: toggle it (a "set" cheat runs one pass)
-- (void)toggleCheat:(NSMenuItem *)it {
-    dm_cheat_toggle((int)it.tag);
-    it.state = dm_cheat_on_at((int)it.tag) ? NSControlStateValueOn : NSControlStateValueOff;   // The new state right now; a run-time [RED] kill shows its reason when the menu next opens
-    if (g_cheats_panel) [g_cheats_panel refresh];   // the panel (if created) follows the menu so the two never disagree; its visibility is checked there
-}
-// Cheats On: the master switch
-- (void)toggleMaster:(NSMenuItem *)it { (void)it; dm_cheats_master_set(!dm_cheats_master()); if (g_cheats_panel) [g_cheats_panel refresh]; }
-// Restore Saved Cheats: leave safe mode
-- (void)restoreSafe:(NSMenuItem *)it { (void)it; dm_cheats_safe_restore(); if (g_cheats_panel) [g_cheats_panel refresh]; }
-// Reload cheats (⌘R): re-read the file in place
-- (void)reloadCheats:(NSMenuItem *)it { (void)it; dm_cheats_reload(); if (g_cheats_panel) [g_cheats_panel refresh]; }
-// Open cheats folder: create it when missing, reveal it in Finder
-- (void)openCheatsFolder:(NSMenuItem *)it { (void)it; cheats_open_folder(); }
-// Lazily create the panel on the first Show Cheats Window (it is kept for the process's lifetime) and order it front:
-// orderFront keeps the game the key window
-- (void)showPanel:(NSMenuItem *)it {
-    (void)it;
-    if (!g_cheats_panel) g_cheats_panel = [DmCheatsPanel new];   // created here, on the first Show Cheats Window
-    [g_cheats_panel show];
-}
-@end
-static DmCheatsMenuDelegate *g_cheats_menu;   // NSMenu keeps its delegate unretained
-
-@implementation DmCheatsPanel {
-    NSPanel *_panel;              // created once in show, kept for the process's lifetime
-    NSTextField *_header;         // the one-line status line above the rows
-    NSStackView *_safeRow;        // safe mode's line and Restore, hidden otherwise
-    NSButton *_master;            // Cheats On: the master switch
-    NSButton *_selectAll;         // enabled while some plain cheat is off
-    NSButton *_deselectAll;       // enabled while some plain cheat is on
-    NSSearchField *_search;       // filters the rows by name and section
-    NSScrollView *_scroll;        // scrolls the rows
-    NSStackView *_stack;          // the rows (vertical, leading alignment), inside _doc
-    NSView *_doc;                 // the flipped document view the stack is pinned to
-    NSTextField *_details;        // a cheat's dry run and note, or the load report
-    NSButton *_openFolder;        // disabled while dm_cheats_dir_path() is empty
-    NSMutableDictionary<NSNumber *, NSButton *> *_checks;   // cheat index -> its checkbox (or Apply button), to update in place
-    NSMutableDictionary<NSNumber *, NSTextField *> *_values; // cheat index -> its value field
-    NSMutableDictionary<NSNumber *, NSTextField *> *_labels; // cheat index -> the name label of a "set" cheat's row
-    BOOL _rebuilding;             // the rows are being replaced: a field's end of editing then applies nothing
-    NSString *_rows_sig;          // what the rows on screen were built from: a change rebuilds
-    int _detailsFor;              // the cheat whose details are shown (-1: the report, -2: nothing)
-    NSTimer *_refreshTimer;       // ~1 s, scheduled only while the panel is on screen; invalidated when it hides
-    BOOL _upOnDeactivate;         // the panel was on screen when the app was deactivated: AppKit brings it back on activation
-    BOOL _finding;                // a Find Cheats… scan is running on a background queue: another click does not start a second one
-}
-
-// A button of the panel's toolbar rows
-static NSButton *panel_button(NSString *title, id target, SEL action) { return [NSButton buttonWithTitle:title target:target action:action]; }
-
-// A horizontal row of views, leading-aligned
-static NSStackView *panel_hrow(NSArray<NSView *> *views) {
-    NSStackView *s = [NSStackView stackViewWithViews:views];
-    s.orientation = NSUserInterfaceLayoutOrientationHorizontal; s.spacing = 8; s.translatesAutoresizingMaskIntoConstraints = NO;
-    return s;
-}
-
-// A secondary-colour label that truncates instead of widening the panel, its whole text in the tooltip
-static NSTextField *panel_note(NSString *text) {
-    NSTextField *l = [NSTextField labelWithString:text];
-    l.textColor = NSColor.secondaryLabelColor; l.lineBreakMode = NSLineBreakByTruncatingTail; l.toolTip = text;
-    [l setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
-    return l;
-}
-
-// Create the panel, the content view and the fixed layout once (header, safe-mode line, toolbar, scrolled rows, details,
-// bottom buttons); refresh fills the rows afterwards
-- (void)makePanel {
-    _panel = [[DmCheatsNSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 480, 560)
-                                                styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
-                                                        | NSWindowStyleMaskUtilityWindow
-                                                  backing:NSBackingStoreBuffered defer:NO];
-    _panel.title = @"Cheats";
-    _panel.releasedWhenClosed = NO;         // the close button only hides (windowShouldClose)
-    _panel.floatingPanel = YES;             // above the game window
-    _panel.becomesKeyOnlyIfNeeded = YES;    // a checkbox click never takes the key window: the game keeps keyboard and controllers
-    _panel.collectionBehavior = NSWindowCollectionBehaviorFullScreenAuxiliary;   // shows over the fullscreen game too
-    _panel.frameAutosaveName = @"DmCheatsPanel";   // place and size remembered (set after the frame is read back: makePanel's end)
-    _panel.minSize = NSMakeSize(360, 260);
-    _panel.delegate = self;
-    NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
-    [nc addObserver:self selector:@selector(appResignedActive:) name:NSApplicationDidResignActiveNotification object:NSApp];
-    [nc addObserver:self selector:@selector(appBecameActive:) name:NSApplicationDidBecomeActiveNotification object:NSApp];
-    DmCheatsDropView *content = [[DmCheatsDropView alloc] initWithFrame:NSMakeRect(0, 0, 480, 560)];
-    [content registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
-    _panel.contentView = content;
-
-    _header = [NSTextField labelWithString:@""];
-    _header.translatesAutoresizingMaskIntoConstraints = NO;
-    _header.lineBreakMode = NSLineBreakByTruncatingTail;
-    [_header setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
-    NSTextField *safeText = panel_note(@"Last run ended unexpectedly with cheats on: all are off.");
-    safeText.textColor = NSColor.systemOrangeColor;
-    _safeRow = panel_hrow(@[safeText, panel_button(@"Restore", self, @selector(restoreSafe:))]);
-    _master = [NSButton checkboxWithTitle:@"Cheats On" target:self action:@selector(toggleMaster:)];
-    _selectAll = panel_button(@"Select All", self, @selector(selectAllCheats:));
-    _deselectAll = panel_button(@"Deselect All", self, @selector(deselectAllCheats:));
-    _search = [NSSearchField new];
-    _search.placeholderString = @"Search";
-    _search.delegate = self;
-    _search.sendsSearchStringImmediately = YES;
-    [_search setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
-    NSStackView *tools = panel_hrow(@[_master, _selectAll, _deselectAll, _search]);
-
-    _scroll = [[NSScrollView alloc] initWithFrame:NSZeroRect];
-    _scroll.hasVerticalScroller = YES; _scroll.autohidesScrollers = YES;
-    _scroll.translatesAutoresizingMaskIntoConstraints = NO;
-    _doc = [[DmCheatsDocView alloc] initWithFrame:NSZeroRect];
-    _doc.translatesAutoresizingMaskIntoConstraints = NO;
-    _scroll.documentView = _doc;
-    _stack = [[NSStackView alloc] initWithFrame:NSZeroRect];
-    _stack.orientation = NSUserInterfaceLayoutOrientationVertical;
-    _stack.alignment = NSLayoutAttributeLeading;
-    _stack.spacing = 4;
-    _stack.edgeInsets = NSEdgeInsetsMake(8, 8, 8, 8);
-    _stack.translatesAutoresizingMaskIntoConstraints = NO;
-    [_doc addSubview:_stack];
-    [NSLayoutConstraint activateConstraints:@[
-        [_stack.topAnchor constraintEqualToAnchor:_doc.topAnchor],
-        [_stack.leadingAnchor constraintEqualToAnchor:_doc.leadingAnchor],
-        [_stack.trailingAnchor constraintEqualToAnchor:_doc.trailingAnchor],
-        [_doc.leadingAnchor constraintEqualToAnchor:_scroll.contentView.leadingAnchor],
-        [_doc.widthAnchor constraintEqualToAnchor:_scroll.contentView.widthAnchor],     // no horizontal scrolling
-        [_doc.topAnchor constraintEqualToAnchor:_scroll.contentView.topAnchor],
-        [_doc.bottomAnchor constraintEqualToAnchor:_stack.bottomAnchor],
-    ]];
-
-    _details = [NSTextField wrappingLabelWithString:@""];
-    _details.translatesAutoresizingMaskIntoConstraints = NO;
-    _details.selectable = NO;   // a selectable label would make the panel key on a click and keep the keyboard from the game
-    _details.font = [NSFont monospacedSystemFontOfSize:NSFont.smallSystemFontSize weight:NSFontWeightRegular];
-    _details.maximumNumberOfLines = 8;
-    [_details setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
-    _detailsFor = -2;
-
-    _openFolder = panel_button(@"Open Folder", self, @selector(openFolder:));
-    NSStackView *bottom = panel_hrow(@[panel_button(@"Reload", self, @selector(reload:)), _openFolder,
-                                       panel_button(@"Find Cheats…", self, @selector(findCheats:)), panel_button(@"Report", self, @selector(showReport:))]);
-    // the header, the safe-mode line and the toolbar in one column: a stack view detaches a hidden view, so the safe-mode
-    // line takes no room while it is hidden
-    NSStackView *top = [NSStackView stackViewWithViews:@[_header, _safeRow, tools]];
-    top.orientation = NSUserInterfaceLayoutOrientationVertical; top.alignment = NSLayoutAttributeLeading; top.spacing = 6;
-    top.translatesAutoresizingMaskIntoConstraints = NO;
-    for (NSView *v in @[top, _scroll, _details, bottom]) [content addSubview:v];
-    [NSLayoutConstraint activateConstraints:@[
-        [top.topAnchor constraintEqualToAnchor:content.topAnchor constant:10],
-        [top.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:8],
-        [top.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-8],
-        [_header.trailingAnchor constraintEqualToAnchor:top.trailingAnchor],
-        [tools.trailingAnchor constraintEqualToAnchor:top.trailingAnchor],
-        [_scroll.topAnchor constraintEqualToAnchor:top.bottomAnchor constant:8],
-        [_scroll.leadingAnchor constraintEqualToAnchor:content.leadingAnchor],
-        [_scroll.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
-        [_scroll.bottomAnchor constraintEqualToAnchor:_details.topAnchor constant:-6],
-        [_details.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:8],
-        [_details.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-8],
-        [_details.bottomAnchor constraintEqualToAnchor:bottom.topAnchor constant:-6],
-        [bottom.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:8],
-        [bottom.trailingAnchor constraintLessThanOrEqualToAnchor:content.trailingAnchor constant:-8],
-        [bottom.bottomAnchor constraintEqualToAnchor:content.bottomAnchor constant:-8],
-    ]];
-    _checks = [NSMutableDictionary dictionary];
-    _values = [NSMutableDictionary dictionary];
-    _labels = [NSMutableDictionary dictionary];
-    _rows_sig = @"";
-    if (![_panel setFrameUsingName:@"DmCheatsPanel"] && g_win) {   // first use: beside the game window, not the screen's corner
-        NSRect g = g_win.frame, f = _panel.frame;
-        [_panel setFrameOrigin:NSMakePoint(NSMaxX(g) + 8, NSMaxY(g) - f.size.height)];
-    }
-}
-
-// The panel became key: keep it only while one of its fields is being edited (a click elsewhere, Full Keyboard Access
-// on a button, the search field's clear button); otherwise the keyboard goes back to the game a main-queue turn later,
-// once the click has settled the first responder
-- (void)windowDidBecomeKey:(NSNotification *)n {
-    (void)n;
-    dispatch_async(dispatch_get_main_queue(), ^{ if (![self editing]) [self giveKeyBack]; });
-}
-
-// Is the search field or a value field being edited (its field editor is the panel's first responder)?
-- (BOOL)editing {
-    if (_search.currentEditor) return YES;
-    for (NSTextField *v in _values.allValues) if (v.currentEditor) return YES;
-    return NO;
-}
-
-// Give the keyboard back to the game: after typing in the search or a value field (Return, Escape, the end of editing)
-- (void)giveKeyBack {
-    if (g_win && _panel.isKeyWindow) [g_win makeKeyWindow];
-}
-
-// ---- the actions ----
-
-// Open Folder: create the cheats folder when missing, reveal it in Finder
-- (void)openFolder:(NSButton *)b { (void)b; cheats_open_folder(); }
-// Reload: re-read the file in place (edits during play need no re-launch)
-- (void)reload:(NSButton *)b { (void)b; dm_cheats_reload(); [self refresh]; }
-// Cheats On: the master switch (off stops every cheat without touching the toggles)
-- (void)toggleMaster:(NSButton *)b { (void)b; dm_cheats_master_set(!dm_cheats_master()); [self refresh]; }
-// Restore (safe mode): the saved toggles and the masters come back
-- (void)restoreSafe:(NSButton *)b { (void)b; dm_cheats_safe_restore(); [self refresh]; }
-// Report: the load report in the details line
-- (void)showReport:(NSButton *)b { (void)b; _detailsFor = -1; [self fillDetails]; }
-
-// Select All / Deselect All: flip every plain cheat (kind 0) that is not already in the wanted state, then one refresh.
-// The loop over dm_cheat_toggle instead of a bulk call keeps the C API small; each toggle rewrites <build ID>.enabled once
-// (a few tiny writes), and a pass between two toggles sees a mix for one frame, which is harmless. Masters, disabled
-// cheats, labels and "set" cheats (Select All must not fire them) are never touched, nor the off half of a pair
-// (hle_cheats.c switches it with its on half)
-- (void)setPlainCheatsOn:(BOOL)on {
-    for (int i = 0, n = dm_cheats_ncheats(); i < n; i++) {
-        if (dm_cheat_kind_at(i) != 0 || (dm_cheat_flags_at(i) & (DM_CHEAT_PAIR_OFF | DM_CHEAT_ONCE))) continue;
-        if (!!dm_cheat_on_at(i) == on) continue;
-        dm_cheat_toggle(i);
-    }
-    [self refresh];
-}
-// The two buttons behind setPlainCheatsOn:
-- (void)selectAllCheats:(NSButton *)b   { (void)b; [self setPlainCheatsOn:YES]; }
-- (void)deselectAllCheats:(NSButton *)b { (void)b; [self setPlainCheatsOn:NO]; }
-
-// A checkbox click (or an Apply button: a "set" cheat runs one pass and turns itself off): flip the cheat (hle_cheats.c
-// also rewrites <build ID>.enabled), then refresh — the state comes back from the model
-- (void)cheatClicked:(NSButton *)b {
-    int i = (int)b.tag;
-    BOOL apply = i >= 0 && i < dm_cheats_ncheats() && (dm_cheat_flags_at(i) & DM_CHEAT_ONCE);
-    if (apply && dm_cheat_on_at(i)) return;   // Apply only applies: one already waiting for its pass is not cancelled
-    if (i >= 0 && i < dm_cheats_ncheats()) dm_cheat_toggle(i);
-    if (_detailsFor == i) [self fillDetails];
-    [self refresh];
-}
-
-// ⓘ: show the cheat's details below the rows (its dry run now, its note)
-- (void)infoClicked:(NSButton *)b { _detailsFor = (int)b.tag; [self fillDetails]; }
-
-// A field's edit ended. A value field (still the row's own: a rebuild ends edits without applying them) sets its value;
-// a refused one beeps and shows the current value again. The keyboard goes back to the game only for Return (or the
-// search field's Escape), not when the player moved on to another field of the panel (Tab, a click)
-- (void)controlTextDidEndEditing:(NSNotification *)n {
-    NSTextField *f = n.object;
-    NSInteger how = [n.userInfo[@"NSTextMovement"] integerValue];
-    BOOL done = how == NSTextMovementReturn || how == NSTextMovementCancel;
-    if (f != (id)_search && !_rebuilding && _values[@(f.tag)] == f) {
-        int i = (int)f.tag;
-        if (dm_cheat_value_set(i, f.stringValue.UTF8String)) {
-            NSBeep();
-            char v[64]; if (dm_cheat_value_get(i, v, sizeof v)) f.stringValue = @(v);
-        }
-        if (_detailsFor == i) [self fillDetails];
-    }
-    if (done) [self giveKeyBack];
-}
-
-// The search text changed: the rows are filtered again (the signature includes it, so refresh rebuilds)
-- (void)controlTextDidChange:(NSNotification *)n { if (n.object == _search) [self refresh]; }
-
-// Escape: in a value field it abandons the typed text (the current value comes back, nothing is applied); in the search
-// field it clears the search as usual. Either way the keyboard goes back to the game (Return ends editing,
-// controlTextDidEndEditing)
-- (BOOL)control:(NSControl *)c textView:(NSTextView *)tv doCommandBySelector:(SEL)sel {
-    (void)tv;
-    if (sel != @selector(cancelOperation:)) return NO;
-    if (c == (id)_search) { dispatch_async(dispatch_get_main_queue(), ^{ [self giveKeyBack]; }); return NO; }
-    NSTextField *f = (NSTextField *)c;
-    [f abortEditing];
-    char v[64]; if (dm_cheat_value_get((int)f.tag, v, sizeof v)) f.stringValue = @(v);
-    [self giveKeyBack];
-    return YES;
-}
-
-// ---- Find Cheats… and the import ----
-
-// The cheat files of this game the usual places hold, this build's own first:
-//   - Ryujinx: mods/contents/<title ID>/cheats/ and its mods' own cheats folders (mods/contents/<title ID>/<mod>/cheats/);
-//   - the yuzu family: load/<title ID>/<mod>/cheats/;
-//   - the Atmosphère tree of a mounted local volume (an SD card); network volumes are not listed (a stall even off the main thread).
-// Only the .txt files named after a build ID count (not Ryujinx's enabled.txt); each folder is read once whatever case
-// the path came in. build: this build's ID (read from the engine on the main thread by the caller). Runs on a background
-// queue (findCheats:): it touches only the file system and Foundation, never AppKit or the cheats engine
-static NSArray<NSURL *> *found_cheat_files(NSString *build) {
-    NSString *tid = [NSString stringWithFormat:@"%016llX", (unsigned long long)DM_GAME_PROGRAM_ID];
-    NSString *as = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support"];
-    NSMutableArray<NSString *> *dirs = [NSMutableArray array];
-    NSFileManager *fm = NSFileManager.defaultManager;
-    for (NSString *t in @[tid.lowercaseString, tid]) {
-        NSString *mods = [as stringByAppendingFormat:@"/Ryujinx/mods/contents/%@", t];
-        [dirs addObject:[mods stringByAppendingString:@"/cheats"]];
-        for (NSString *m in [fm contentsOfDirectoryAtPath:mods error:nil] ?: @[]) [dirs addObject:[mods stringByAppendingFormat:@"/%@/cheats", m]];
-    }
-    for (NSString *emu in @[@"yuzu", @"citron", @"eden", @"sudachi", @"suyu"]) {
-        NSString *load = [as stringByAppendingFormat:@"/%@/load/%@", emu, tid];
-        for (NSString *m in [fm contentsOfDirectoryAtPath:load error:nil] ?: @[]) [dirs addObject:[load stringByAppendingFormat:@"/%@/cheats", m]];
-    }
-    for (NSURL *vol in [fm mountedVolumeURLsIncludingResourceValuesForKeys:@[NSURLVolumeIsLocalKey] options:NSVolumeEnumerationSkipHiddenVolumes] ?: @[]) {
-        NSNumber *local = nil; [vol getResourceValue:&local forKey:NSURLVolumeIsLocalKey error:nil];
-        NSString *root = vol.path;   // nil for a volume without a file-system path: nothing to look in
-        if (local.boolValue && root) [dirs addObject:[root stringByAppendingFormat:@"/atmosphere/contents/%@/cheats", tid]];
-    }
-    NSMutableArray<NSURL *> *mine = [NSMutableArray array], *rest = [NSMutableArray array];
-    NSMutableSet<NSString *> *seen = [NSMutableSet set];
-    NSCharacterSet *nothex = [NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdefABCDEF"].invertedSet;
-    for (NSString *d in dirs) {
-        NSString *real = [d stringByResolvingSymlinksInPath].lowercaseString;   // one folder however its path was spelled
-        if ([seen containsObject:real]) continue;
-        [seen addObject:real];
-        for (NSString *f in [fm contentsOfDirectoryAtPath:d error:nil] ?: @[]) {
-            if (f.length != 20 || ![f.lowercaseString hasSuffix:@".txt"] || [[f substringToIndex:16] rangeOfCharacterFromSet:nothex].location != NSNotFound) continue;
-            NSURL *u = [NSURL fileURLWithPath:[d stringByAppendingPathComponent:f]];
-            [([f.uppercaseString hasPrefix:build] ? mine : rest) addObject:u];
-        }
-    }
-    [mine addObjectsFromArray:rest];
-    return mine;
-}
-
-// Find Cheats…: a menu of the files found, under the button; picking one imports it. The folders are read on a background
-// queue, since a sleeping external disk can take seconds to answer and the main thread would beachball the game window
-// meanwhile; the button reads "Looking…" and is disabled until the scan ends, and _finding keeps a second click (or an
-// action sent while disabled) from starting another scan. The menu is built and shown on the main queue, and only while
-// the panel is still on screen (it hides when the app is deactivated): a menu popping up out of nowhere would be worse
-- (void)findCheats:(NSButton *)b {
-    if (_finding) return;
-    _finding = YES;
-    NSString *title = b.title;
-    b.title = @"Looking…"; b.enabled = NO;
-    NSString *build = engine_str(dm_cheats_build());   // the engine's state is read here, on the main thread, not by the scan
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSArray<NSURL *> *found = found_cheat_files(build);
-        dispatch_async(dispatch_get_main_queue(), ^{
-            self->_finding = NO;
-            b.title = title; b.enabled = YES;
-            if (b.window.visible) [self showFound:found under:b];
-        });
-    });
-}
-// The files a Find Cheats… scan found, as a menu under its button (main thread)
-- (void)showFound:(NSArray<NSURL *> *)found under:(NSButton *)b {
-    NSMenu *m = [NSMenu new];
-    if (!found.count) [m addItemWithTitle:@"No cheat files of this game in Ryujinx, the yuzu family or an SD card" action:nil keyEquivalent:@""].enabled = NO;
-    for (NSURL *u in found) {
-        NSString *parent = u.URLByDeletingLastPathComponent.path.stringByAbbreviatingWithTildeInPath;
-        NSMenuItem *it = [m addItemWithTitle:[NSString stringWithFormat:@"%@ — %@", u.lastPathComponent, parent] action:@selector(importFound:) keyEquivalent:@""];
-        it.target = self; it.representedObject = u;
-    }
-    [m popUpMenuPositioningItem:nil atLocation:NSMakePoint(0, b.bounds.size.height) inView:b];
-}
-// A file picked in Find Cheats…: import it
-- (void)importFound:(NSMenuItem *)it { if (it.representedObject) [self importFiles:@[it.representedObject]]; }
-
-// A yes / no question as a modal alert, answered before returning (the import is the player's own action, so a modal
-// question is fine; the keyboard goes back to the game after it): YES for the first button
-- (BOOL)ask:(NSString *)text info:(NSString *)info yes:(NSString *)yes {
-    NSAlert *a = [NSAlert new];
-    a.messageText = text; a.informativeText = info ?: @"";
-    [a addButtonWithTitle:yes]; [a addButtonWithTitle:@"Cancel"];
-    BOOL r = [a runModal] == NSAlertFirstButtonReturn;
-    [self giveKeyBack];
-    return r;
-}
-
-// Copy cheat files into the cheats folder, then reload: a .cheats.toml (an anchored source) keeps its name; a .txt keeps a
-// build ID name, and a file named otherwise (a Ryujinx list such as "all cheats.txt") becomes this build's after the
-// player confirms it is for this build. A file already there is kept as <name>.bak (asked first). Returns whether
-// something was imported
-- (BOOL)importFiles:(NSArray<NSURL *> *)urls {
-    const char *dirc = dm_cheats_dir_path();
-    if (!dirc || !*dirc || strlen(dm_cheats_build()) != 16) { NSBeep(); return NO; }   // no folder, or no build ID to name a file by
-    NSString *dir = engine_str(dirc), *build = engine_str(dm_cheats_build());
-    NSString *tid = [NSString stringWithFormat:@"%016llX", (unsigned long long)DM_GAME_PROGRAM_ID];
-    NSFileManager *fm = NSFileManager.defaultManager;
-    [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-    BOOL any = NO;
-    for (NSURL *u in urls) {
-        NSString *name = u.lastPathComponent, *dest;
-        if ([name.lowercaseString hasSuffix:@".cheats.toml"]) dest = name;
-        else if (![name.lowercaseString hasSuffix:@".txt"]) continue;
-        else {
-            NSString *stem = name.length >= 16 ? [name substringToIndex:16].uppercaseString : @"";
-            BOOL hex = stem.length == 16 && [stem rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@"0123456789ABCDEF"].invertedSet].location == NSNotFound;
-            if (hex && ![stem isEqualToString:tid]) dest = [stem stringByAppendingString:@".txt"];   // a title ID name says no build
-            else {
-                if (![self ask:[NSString stringWithFormat:@"Is “%@” for this version of the game?", name]
-                          info:[NSString stringWithFormat:@"Its name does not say which build it is for. It will be used as the cheats of %@.", build_label(dm_cheats_build(), dm_cheats_version())]
-                           yes:@"Use for This Build"]) continue;
-                dest = [build stringByAppendingString:@".txt"];
-            }
-        }
-        NSString *path = [dir stringByAppendingPathComponent:dest];
-        if ([u.path.stringByStandardizingPath.lowercaseString isEqualToString:path.stringByStandardizingPath.lowercaseString]) continue;   // already the folder's own file
-        if ([fm fileExistsAtPath:path]) {
-            if (![self ask:[NSString stringWithFormat:@"Replace %@?", dest] info:[NSString stringWithFormat:@"The current one is kept as %@.bak (an older %@.bak is replaced).", dest, dest] yes:@"Replace"]) continue;
-            NSString *bak = [path stringByAppendingString:@".bak"];
-            [fm removeItemAtPath:bak error:nil];
-            [fm moveItemAtPath:path toPath:bak error:nil];
-        }
-        NSError *e = nil;
-        if ([fm copyItemAtURL:u toURL:[NSURL fileURLWithPath:path] error:&e]) any = YES;
-        else LOG("[RED] cheats: cannot copy %s into the cheats folder: %s", u.path.UTF8String, e.localizedDescription.UTF8String);
-    }
-    if (any) { dm_cheats_reload(); _detailsFor = -1; [self refresh]; [self fillDetails]; }
-    return any;
-}
-
-// ---- the rows ----
-
-// A row of one cheat: its checkbox (or, for a "set" cheat, its name and an Apply button), its value field for an "ask"
-// cheat, and ⓘ. The title truncates and is whole in the tooltip, so a long one never widens the panel
-- (NSView *)cheatRow:(int)i {
-    int kind = dm_cheat_kind_at(i), f = dm_cheat_flags_at(i);
-    NSString *title = cheat_row_title(i), *tip = cheat_row_tip(i);
-    NSMutableArray<NSView *> *views = [NSMutableArray array];
-    NSButton *b;
-    if (f & DM_CHEAT_ONCE) {
-        NSTextField *l = [NSTextField labelWithString:title];
-        l.lineBreakMode = NSLineBreakByTruncatingTail; l.toolTip = tip;
-        _labels[@(i)] = l;
-        [l setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
-        [views addObject:l];
-        b = panel_button(@"Apply", self, @selector(cheatClicked:));
-        b.controlSize = NSControlSizeSmall;
-    } else {
-        b = [NSButton checkboxWithTitle:title target:self action:@selector(cheatClicked:)];
-        ((NSButtonCell *)b.cell).lineBreakMode = NSLineBreakByTruncatingTail;
-        [b setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
-        b.state = cheat_row_state(i);
-    }
-    b.tag = i; b.enabled = kind == 0; b.toolTip = tip;
-    _checks[@(i)] = b;
-    if (!(f & DM_CHEAT_ONCE)) [views addObject:b];
-    if (f & DM_CHEAT_ASK) {
-        NSTextField *v = [NSTextField textFieldWithString:@""];
-        char cur[64]; if (dm_cheat_value_get(i, cur, sizeof cur)) v.stringValue = @(cur);
-        v.placeholderString = @(dm_cheat_value_bounds(i));
-        v.toolTip = [NSString stringWithFormat:@"Value (%s, %s)", dm_cheat_type_at(i), dm_cheat_value_bounds(i)];
-        v.tag = i; v.delegate = self; v.controlSize = NSControlSizeSmall;
-        [v.widthAnchor constraintEqualToConstant:90].active = YES;
-        _values[@(i)] = v;
-        [views addObject:v];
-    }
-    if (f & DM_CHEAT_ONCE) [views addObject:b];
-    NSImage *icon = [NSImage imageWithSystemSymbolName:@"info.circle" accessibilityDescription:@"Details"];   // nil only if the symbol is gone
-    NSButton *info = icon ? [NSButton buttonWithImage:icon target:self action:@selector(infoClicked:)] : [NSButton buttonWithTitle:@"i" target:self action:@selector(infoClicked:)];
-    info.bordered = NO; info.tag = i; info.toolTip = @"Show what it writes now, and its note";
-    [views addObject:info];
-    return panel_hrow(views);
-}
-
-// A section header: the section's name in bold
-- (NSView *)sectionRow:(const char *)name {
-    NSTextField *l = [NSTextField labelWithString:engine_str(name)];
-    l.font = [NSFont boldSystemFontOfSize:NSFont.systemFontSize];
-    return l;
-}
-
-// Does entry i pass the search text (its name or its section contains it, any case)?
-- (BOOL)matches:(int)i {
-    NSString *q = _search.stringValue;
-    if (!q.length) return YES;
-    return [cheat_display_name(i) rangeOfString:q options:NSCaseInsensitiveSearch].location != NSNotFound
-        || [engine_str(dm_cheat_section_at(i)) rangeOfString:q options:NSCaseInsensitiveSearch].location != NSNotFound;
-}
-
-// What the rows on screen were built from: the signature rebuilt on every refresh, the rows rebuilt when it differs (the
-// list, the flags that choose a row's controls, the search text). States and titles are not in it: they change per cheat
-// and the update path carries them in place
-- (NSString *)rowsSig {
-    NSMutableString *s = [NSMutableString stringWithFormat:@"%d/%d/%@/", dm_cheats_ncheats(), dm_cheats_found(), _search.stringValue];
-    for (int i = 0, n = dm_cheats_ncheats(); i < n; i++) [s appendFormat:@"%@:%d|", engine_str(dm_cheat_name_at(i)), dm_cheat_flags_at(i)];
-    for (int i = 0, n = dm_cheats_nothers(); i < n; i++) [s appendFormat:@"%@:%@|", engine_str(dm_cheats_other(i)), engine_str(dm_cheats_other_version(i))];
-    for (int i = 0, n = dm_cheats_nskipped(); i < n; i++) [s appendFormat:@"%@|", engine_str(dm_cheats_skipped_name(i))];
-    for (int i = 0, n = dm_cheats_nsources(); i < n; i++) [s appendFormat:@"%@|", engine_str(dm_cheats_source(i))];
-    return s;
-}
-
-// Rebuild all rows (a reload, a first fill, a new search), keeping the scroll position as far as possible
-- (void)rebuildRows {
-    NSClipView *clip = _scroll.contentView;
-    CGFloat keepY = clip.bounds.origin.y;
-    _rebuilding = YES;   // an edit in progress ends now without being applied (its row may be another cheat after a reload)
-    for (NSTextField *v in _values.allValues) if (v.currentEditor) [v abortEditing];
-    for (NSView *v in [_stack.arrangedSubviews copy]) [v removeFromSuperview];
-    _rebuilding = NO;
-    [_checks removeAllObjects]; [_values removeAllObjects]; [_labels removeAllObjects];
-    const char *sec = "";
-    for (int i = 0, n = dm_cheats_ncheats(); i < n; i++) {
-        if (!cheat_has_row(i) || ![self matches:i]) continue;
-        const char *s = dm_cheat_section_at(i);
-        if (strcmp(s, sec)) { sec = s; if (*s) [_stack addArrangedSubview:[self sectionRow:s]]; }
-        if (dm_cheat_kind_at(i) == 3) [_stack addArrangedSubview:panel_note(cheat_display_name(i))];   // a label: credits and the like
-        else [_stack addArrangedSubview:[self cheatRow:i]];
-    }
-    for (int i = 0, n = dm_cheats_nskipped(); i < n; i++)
-        [_stack addArrangedSubview:panel_note([NSString stringWithFormat:@"Left out of this build: %@ — %@", engine_str(dm_cheats_skipped_name(i)), engine_str(dm_cheats_skipped_why(i))])];
-    for (int i = 0, n = dm_cheats_nothers(); i < n; i++)
-        [_stack addArrangedSubview:panel_note([NSString stringWithFormat:@"Cheats for %@: another version of the game, its addresses do not fit this one",
-                                                build_label(dm_cheats_other(i), dm_cheats_other_version(i))])];
-    if (!dm_cheats_found())
-        for (int i = 0, n = dm_cheats_nsources(); i < n; i++) {
-            NSButton *copy = panel_button(@"Copy Command", self, @selector(copyCompile:)); copy.tag = i; copy.controlSize = NSControlSizeSmall;
-            [_stack addArrangedSubview:panel_hrow(@[panel_note([NSString stringWithFormat:@"%@: anchored cheats, not compiled for this build yet", engine_str(dm_cheats_source(i))]), copy])];
-        }
-    _rows_sig = [self rowsSig];
-    if (keepY <= 0) return;   // at the top already: the new rows start at the top too
-    __weak DmCheatsPanel *wself = self;   // one main-queue tick later: the panel may be hidden by then
-    dispatch_async(dispatch_get_main_queue(), ^{
-        DmCheatsPanel *s = wself;
-        if (!s || !s->_panel || !s->_panel.isVisible) return;
-        NSClipView *c = s->_scroll.contentView;
-        CGFloat max = fmax(0, s->_doc.frame.size.height - c.bounds.size.height);
-        [c setBoundsOrigin:NSMakePoint(0, fmin(keepY, max))];
-    });
-}
-
-// Copy Command: the command that compiles an anchored source for this build (scripts/cheat_anchor.py, run from the
-// nxnative repository's folder; the build's ExeFS/main is the one the NSP script extracted), paths quoted for the shell
-- (void)copyCompile:(NSButton *)b {
-    NSString *dir = engine_str(dm_cheats_dir_path());
-    NSString *cmd = [NSString stringWithFormat:@"python3 scripts/cheat_anchor.py compile %@ --nso '<the ExeFS/main of build %@>' -o %@",
-                     shell_quote([dir stringByAppendingPathComponent:engine_str(dm_cheats_source((int)b.tag))]), engine_str(dm_cheats_build()), shell_quote(dir)];
-    [NSPasteboard.generalPasteboard clearContents];
-    [NSPasteboard.generalPasteboard setString:cmd forType:NSPasteboardTypeString];
-    _detailsFor = -2;   // the timer leaves this text alone
-    _details.stringValue = [@"Copied (run it in the nxnative folder): " stringByAppendingString:cmd];
-}
-
-// Update the rows in place (a click, a timer tick, a menu toggle): each control's state, enabled flag and title; a value
-// field the player is editing is left alone
-- (void)updateRows {
-    [_checks enumerateKeysAndObjectsUsingBlock:^(NSNumber *k, NSButton *b, BOOL *stop) {
-        (void)stop; int i = k.intValue;
-        BOOL once = (dm_cheat_flags_at(i) & DM_CHEAT_ONCE) != 0;
-        b.enabled = dm_cheat_kind_at(i) == 0 && (!once || (dm_cheats_master() && !dm_cheat_on_at(i)));   // Apply: not while one waits
-        if (once) {
-            NSTextField *l = self->_labels[k];
-            NSString *full = cheat_row_title(i);
-            if (l && ![l.stringValue isEqualToString:full]) { l.stringValue = full; l.toolTip = cheat_row_tip(i); }
-        } else {
-            b.state = cheat_row_state(i);
-            NSString *full = cheat_row_title(i);
-            if (![b.title isEqualToString:full]) { b.title = full; b.toolTip = cheat_row_tip(i); }
-        }
-    }];
-    [_values enumerateKeysAndObjectsUsingBlock:^(NSNumber *k, NSTextField *v, BOOL *stop) {
-        (void)stop;
-        if (v.currentEditor) return;
-        char cur[64]; if (dm_cheat_value_get(k.intValue, cur, sizeof cur) && ![v.stringValue isEqualToString:@(cur)]) v.stringValue = @(cur);
-    }];
-}
-
-// The details line: the shown cheat's dry run and note, or the load report
-- (void)fillDetails {
-    if (_detailsFor == -1) { _details.stringValue = engine_str(dm_cheats_report()); return; }
-    if (_detailsFor < 0 || _detailsFor >= dm_cheats_ncheats()) { _details.stringValue = @""; return; }
-    char pv[1024]; dm_cheat_preview(_detailsFor, pv, sizeof pv);
-    NSMutableString *t = [NSMutableString stringWithFormat:@"%@\n%@", cheat_display_name(_detailsFor), engine_str(pv)];
-    const char *note = dm_cheat_note_at(_detailsFor);
-    if (note && *note) [t appendString:engine_str(note)];
-    _details.stringValue = [t stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-}
-
-// The Select All / Deselect All buttons' enable state: Select All while some switchable plain cheat is off, Deselect All
-// while one is on (the same cheats setPlainCheatsOn: flips); both off while Cheats On is off
-- (void)updateSelectButtons {
-    BOOL someOff = NO, someOn = NO;
-    for (int i = 0, n = dm_cheats_ncheats(); i < n; i++) {
-        if (dm_cheat_kind_at(i) != 0 || (dm_cheat_flags_at(i) & (DM_CHEAT_PAIR_OFF | DM_CHEAT_ONCE))) continue;
-        if (dm_cheat_on_at(i)) someOn = YES; else someOff = YES;
-        if (someOn && someOff) break;
-    }
-    _selectAll.enabled = someOff && dm_cheats_master();
-    _deselectAll.enabled = someOn && dm_cheats_master();
-}
-
-// The header's one line (the folder missing, the counts and the build's version, or no file of this build) and the
-// master switch and safe-mode controls
-- (void)fillHeader {
-    const char *dir = dm_cheats_dir_path();
-    int n = 0, on = 0, masters = 0;   // switchable cheats and those on; master codes are counted apart (always on)
-    for (int i = 0, c = dm_cheats_ncheats(); i < c; i++) {
-        int kind = dm_cheat_kind_at(i);
-        if (!cheat_has_row(i) || kind == 3) continue;
-        if (kind == 1) { masters++; continue; }
-        n++; on += kind == 0 && dm_cheat_on_at(i);
-    }
-    NSString *build = build_label(dm_cheats_build(), dm_cheats_version());
-    if (!dir || !*dir) _header.stringValue = @"Cheats are off: no cheats folder (DM_CHEATS or DM_ROOT is not set)";
-    else if (dm_cheats_found()) _header.stringValue = [NSString stringWithFormat:@"%@: %d cheats, %d on%@", build, n, on,
-                                                        masters ? [NSString stringWithFormat:@", %d master", masters] : @""];
-    else _header.stringValue = [NSString stringWithFormat:@"No cheats for %@", build];
-    _header.toolTip = engine_str(dm_cheats_report());
-    _master.state = dm_cheats_master() ? NSControlStateValueOn : NSControlStateValueOff;
-    _safeRow.hidden = !dm_cheats_safe();
-}
-
-// The one refresh: the header and the buttons always, the rows rebuilt when what they show changed, only updated when it
-// did not. Nothing happens while the panel is not on screen — it fills itself in show
-- (void)refresh {
-    if (!_panel || !_panel.isVisible) return;
-    [self fillHeader];
-    [self updateSelectButtons];
-    _openFolder.enabled = ({ const char *d = dm_cheats_dir_path(); d && *d; });
-    if (![_rows_sig isEqualToString:[self rowsSig]]) [self rebuildRows];
-    else [self updateRows];
-}
-
-// Arm the ~1 s refresh unless it is already running: called by show and by the app's return to the foreground
-- (void)startTimer {
-    if (_refreshTimer.isValid) return;
-    _refreshTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 target:self selector:@selector(tick) userInfo:nil repeats:YES];
-}
-
-// One timer tick: refresh the rows (and the details of a shown cheat, whose dry run changes with the game), and stop for a
-// panel that is no longer on screen
-- (void)tick {
-    if (!_panel.isVisible) { [_refreshTimer invalidate]; _refreshTimer = nil; return; }
-    [self refresh];
-    if (_detailsFor >= 0) [self fillDetails];
-}
-
-// The app was deactivated: the utility panel goes off screen with it, so the refresh timer stops until the app comes back
-- (void)appResignedActive:(NSNotification *)n {
-    (void)n;
-    _upOnDeactivate = _panel.isVisible;
-    [_refreshTimer invalidate];
-    _refreshTimer = nil;
-}
-
-// The app is active again: AppKit brings back a panel that was up, so the timer is armed a main-queue turn later
-- (void)appBecameActive:(NSNotification *)n {
-    (void)n;
-    dispatch_async(dispatch_get_main_queue(), ^{ if (_upOnDeactivate) [self startTimer]; });
-}
-
-// Shown: order the panel front (created first if needed) — orderFront, not makeKeyAndOrderFront, so the game window stays
-// key. While the panel is on screen a ~1 s timer refreshes it
-- (void)show {
-    if (!_panel) [self makePanel];
-    [_panel orderFront:self];
-    [self refresh];
-    [self startTimer];
-}
-
-// The close button: hide instead of close (the panel object and its autosaved frame stay), and stop the refresh timer
-- (BOOL)windowShouldClose:(NSWindow *)w {
-    if (w != _panel) return YES;
-    [_refreshTimer invalidate];
-    _refreshTimer = nil;
-    for (NSTextField *v in _values.allValues) if (v.currentEditor) [v abortEditing];   // an unfinished value is abandoned
-    [self giveKeyBack];   // while the panel is still key
-    [_panel orderOut:nil];
-    return NO;
-}
-@end
-
 void front_run(void (*guest)(void)) {
     // A game: tell macOS its work is latency-critical, so the system does not trade its frame time for power while the frame rate is capped
     static id activity; activity = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:@"game"];
@@ -1125,6 +467,9 @@ void front_run(void (*guest)(void)) {
         g_layer.contentsScale = win.backingScaleFactor;
         if (getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"))) { g_layer.developerHUDProperties = @{@"mode": @"default"}; LOG("front end: Metal performance HUD on (DM_METAL_HUD)"); }   // Apple's HUD over the game: frame rate, frame and GPU time, memory
         v.layer = g_layer; [(DmGameView *)v fitDrawable];
+        const char *ov = getenv("DM_OVERLAY"); g_ov_mode = ov && !strcmp(ov, "off") ? 0 : ov && !strcmp(ov, "detailed") ? 2 : 1;
+        g_ov = [[DmOverlay alloc] initWithFrame:NSMakeRect(0, 0, 10, 10)]; [v addSubview:g_ov]; [g_ov refreshWithCPU:0];
+        void s2m_share_attach(NSWindow *win); s2m_share_attach(win);   // the shared shader list: contribution file and the offer to send it, when the game closes (s2m_share.m)
         [win center];
         [win makeKeyAndOrderFront:nil];
         g_screen_fps = (int)(win.screen ?: NSScreen.mainScreen).maximumFramesPerSecond;
@@ -1141,46 +486,11 @@ void front_run(void (*guest)(void)) {
         NSMenu *bar = [NSMenu new], *app = [NSMenu new], *wm = [[NSMenu alloc] initWithTitle:@"Window"];
         [[bar addItemWithTitle:@"" action:nil keyEquivalent:@""] setSubmenu:app];
         [app addItemWithTitle:@"Quit " DM_GAME_NAME action:@selector(terminate:) keyEquivalent:@"q"];
-        // Cheats (hle_cheats.c): the rows rebuild on every open through the delegate, the same rows the file reload changes
-        g_cheats_menu = [DmCheatsMenuDelegate new];
-        NSMenu *cm = [[NSMenu alloc] initWithTitle:@"Cheats"];
-        cm.delegate = g_cheats_menu;
-        cm.autoenablesItems = NO;   // the delegate sets enabled on every row itself
-        // Fill the rows now: AppKit matches a key equivalent (⌘R, ⌘⇧C) only against items that exist, and it calls the
-        // delegate's menuNeedsUpdate: when the menu is opened, not at launch, so without this neither works until the
-        // Cheats menu has been opened once. Every open rebuilds them through the delegate as before
-        [g_cheats_menu menuNeedsUpdate:cm];
-        [[bar addItemWithTitle:@"Cheats" action:nil keyEquivalent:@""] setSubmenu:cm];
-        if (getenv("DM_CHEATS_WINDOW") && atoi(getenv("DM_CHEATS_WINDOW")))   // the Cheats panel open from the start (beside the game, not key)
-            dispatch_async(dispatch_get_main_queue(), ^{ [g_cheats_menu showPanel:nil]; });
         [[bar addItemWithTitle:@"Window" action:nil keyEquivalent:@""] setSubmenu:wm];
         [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
         NSApp.mainMenu = bar;
         const char *fs = getenv("DM_FULLSCREEN");   // 1 (or any value but 0): start in fullscreen; 0, the settings window's Window, or unset: a window
-        if (fs && strcmp(fs, "0")) {
-            // A game opened from a fullscreen app starts while macOS leaves that Space. Wait for activation and for the window to reach the active Space before asking for fullscreen
-            // (whichever happens last), and repeat a refused startup request once. Only a request made here owns a retry; a later player request must never restart startup handling
-            static DmWinDelegate *wd; wd = [DmWinDelegate new]; win.delegate = wd;
-            __block int want = 1, retried = 0, entering = 0;
-            void (^enter)(void) = ^{
-                if (!want || (win.styleMask & NSWindowStyleMaskFullScreen) || !NSApp.isActive || !win.isOnActiveSpace) return;
-                want = 0; entering = 1; [win toggleFullScreen:nil]; };
-            g_fs_failed = ^{
-                if (!entering) return;
-                entering = 0;
-                LOG("front end: fullscreen was refused (app active %d, window on the active Space %d)%s", NSApp.isActive, win.isOnActiveSpace, retried ? "" : ", asking once more");
-                if (retried) return;
-                retried = 1; want = 1; dispatch_async(dispatch_get_main_queue(), enter); };
-            [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; enter(); }];
-            [NSWorkspace.sharedWorkspace.notificationCenter addObserverForName:NSWorkspaceActiveSpaceDidChangeNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; enter(); }];
-            for (NSNotificationName nm in @[NSWindowWillEnterFullScreenNotification, NSWindowWillExitFullScreenNotification])
-                [NSNotificationCenter.defaultCenter addObserverForName:nm object:win queue:nil usingBlock:^(NSNotification *n) {
-                    (void)n; want = 0;
-                    if (!entering) g_fs_failed = nil; }];   // the player took over while startup was waiting; our own transition has entering set
-            [NSNotificationCenter.defaultCenter addObserverForName:NSWindowDidEnterFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) {
-                (void)n; want = 0; entering = 0; g_fs_failed = nil; }];   // startup succeeded: later manual refusals have no startup request to retry
-            dispatch_async(dispatch_get_main_queue(), enter);
-        }
+        if (fs && strcmp(fs, "0")) dispatch_async(dispatch_get_main_queue(), ^{ [win toggleFullScreen:nil]; });
         for (NSNotificationName nm in @[GCControllerDidConnectNotification, GCControllerDidDisconnectNotification])
             [NSNotificationCenter.defaultCenter addObserverForName:nm object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
                 GCController *c = n.object; int conn = n.name == GCControllerDidConnectNotification;
@@ -1191,6 +501,9 @@ void front_run(void (*guest)(void)) {
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e) {
             if (e.window != win) return e;   // Only swallow keys for the game window; other windows such as the software keyboard input box receive typing as usual
             if (e.type == NSEventTypeKeyDown && (e.modifierFlags & NSEventModifierFlagCommand)) return e;   // ⌘ shortcuts go to the menu; a key released while ⌘ is held still reaches the game, or it would stay pressed
+            if (e.keyCode == 18) { if (e.type == NSEventTypeKeyDown && !e.isARepeat) overlay_cycle(); return nil; }   // key 1: the overlay's next mode (not a game button)
+            if (e.keyCode == 19 || (e.keyCode == 53 && g_panel)) { if (e.type == NSEventTypeKeyDown && !e.isARepeat) panel_toggle(); return nil; }   // key 2 (or Esc while it is open): the settings panel
+            if (g_panel) return nil;   // the panel is open: no keys reach the game
             if (!e.isARepeat) on_key(e, e.type == NSEventTypeKeyDown);
             return nil;   // Swallow it to avoid the system beep
         }];

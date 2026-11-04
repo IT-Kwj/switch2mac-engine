@@ -69,16 +69,21 @@ static int focus_notifies(void) { int m = atomic_load(&g_focus_mode); return m !
 // after the InFocus notification (its notification thread main+0x8ea560 sets the flag main+0x87b5d0 takes each frame); with none its 2P character select never took input
 // (GitHub issue #550). The game sees the front end's state, or 2 while an applet is open over an application in focus; a change of what it sees is one notification 15
 static int g_applets; static _Atomic int g_seen = 1; static pthread_mutex_t g_seen_lock = PTHREAD_MUTEX_INITIALIZER;
+// The game sees InFocus until its 300th present (DM_FOCUS_BOOT_HOLD=0 off; dm_focus_boot_done from nvnQueuePresentTexture), then the front end's state. Mario Kart World's focus handler
+// (main+0x26380c4) reads a global (main+0x33e54b0) that is still null during boot: with another window active at launch the host reported OutOfFocus first and the game crashed (sig 11)
+static _Atomic int g_boot_hold = -1;
+static int boot_hold(void) { int h = atomic_load(&g_boot_hold); if (h < 0) { const char *e = getenv("DM_FOCUS_BOOT_HOLD"); h = !(e && !strcmp(e, "0")); int exp = -1; atomic_compare_exchange_strong(&g_boot_hold, &exp, h); h = atomic_load(&g_boot_hold); } return h; }
 static void focus_sync(int applets) {   // applets: +1 an applet opens, -1 one closes, 0 the front end's state changed
     pthread_mutex_lock(&g_seen_lock);
     g_applets += applets;
     if (g_applets < 0) die("dm_applet_leave without dm_applet_enter");
-    int w = atomic_load(&g_focus), s = w == 1 && g_applets ? 2 : w, changed = atomic_exchange(&g_seen, s) != s;
+    int w = boot_hold() ? 1 : atomic_load(&g_focus), s = w == 1 && g_applets ? 2 : w, changed = atomic_exchange(&g_seen, s) != s;
     pthread_mutex_unlock(&g_seen_lock);
     if (!changed) return;   // pushed outside the lock: 15 only says "query the state again", so pushes from two threads need no order
     LOG("oe focus state → %d%s", s, applets > 0 ? " (library applet open)" : applets < 0 ? " (library applet closed)" : "");
     if (focus_notifies()) mq_push(MSG_FOCUS);
 }
+void dm_focus_boot_done(void) { if (boot_hold() && atomic_exchange(&g_boot_hold, 0)) { LOG("oe: boot focus hold released (window focus state %d)", atomic_load(&g_focus)); focus_sync(0); } }
 void dm_applet_enter(const char *name) { LOG("oe library applet: %s", name); focus_sync(1); }
 void dm_applet_leave(void) { focus_sync(-1); }
 int dm_focus_now(void) { return atomic_load(&g_focus); }   // the front end's state, not an applet's: the display link follows the window

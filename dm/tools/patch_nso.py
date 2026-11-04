@@ -12,8 +12,8 @@
 #   Function-matched cuts (MATCH_CUTS of the selected game's patches.py): unknown builds only, unique complete-function and direct-callee fingerprints, then original-byte assertions
 #   Registered observation gates (OBS of the patch files, restricted by build ID): one instruction at the entry is replaced with "enter the host observation callback → execute the original instruction → jump back", so diagnostics modify zero code at runtime; listed in <name>.obs.tsv
 # The key page only stores "actual key number × 8" at the end of the data segment, and patch code fetches thread slots indirectly through the key page: the loader may use any key number.
-# Output: <name>.patched.bin (key page and patch area appended after the image at PATCH_OFF; when that would start beyond 112 MB the patch area sits before the base, see FAR; a text longer than a B reaches adds a second one after the image, see TWO), <name>.fixups.tsv (layout and key page index header), <name>.gates.tsv, <name>.sites.tsv, <name>.cuts.tsv, <name>.obs.tsv, <name>.changed.tsv (the text words whose instructions no longer run as the file has them)
-import struct, re, sys, os, glob, shlex, types, importlib.util, multiprocessing, signal
+# Output: <name>.patched.bin (key page and patch area appended after the image at PATCH_OFF; when that would start beyond 112 MB the patch area sits before the base, see FAR; a text longer than a B reaches adds a second one after the image, see TWO), <name>.fixups.tsv (layout and key page index header), <name>.gates.tsv, <name>.sites.tsv, <name>.cuts.tsv, <name>.obs.tsv
+import struct, re, sys, os, glob, shlex, types, importlib.util
 from itertools import combinations
 import capstone
 if capstone.cs_version()[0] != 5:   # the rewriter uses Capstone 5's names (CS_ARCH_ARM64, ARM64_OP_*), which Capstone 6 renamed: see "Capstone API version" in docs/reference/rewriter.md
@@ -22,12 +22,6 @@ from capstone import *
 from capstone.arm64 import ARM64_OP_IMM, ARM64_OP_MEM, ARM64_OP_REG
 import nso, nso_asm
 from nso_asm import *   # the instruction encoders (B, ADRP, LDRX, ...), shared with the per-build patch files
-
-# The NSP script terminates a failed or cancelled rewrite with SIGTERM. Exit through the pool's context manager so it reaps the workers too.
-signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
-try: WORKERS = int(os.environ.get('DM_REWRITE_J') or os.cpu_count() or 1)
-except ValueError: sys.exit('[RED] DM_REWRITE_J must be a positive integer')
-if WORKERS < 1: sys.exit('[RED] DM_REWRITE_J must be a positive integer')
 
 src, outdir, NAME = sys.argv[1], sys.argv[2], sys.argv[3]
 # An NSO, or an NRO (a module the game loads at run time with nn::ro, Super Smash Bros. Ultimate's fighter code), rewritten as an NSO of the same layout would be. nso.py checks the file
@@ -52,7 +46,6 @@ if TWO: FRONT = int(os.environ.get('DM_PATCH_FRONT', '0'), 0) or 0x1000000
 elif BIG_TEXT: FRONT = int(os.environ.get('DM_PATCH_FRONT', '0'), 0) or (0x8000000 - 0x10000 - MOD.text_end) & ~0xFFFF
 SPLIT = 0x8000000 - FRONT - 0x100000 if TWO else None
 IMG = MOD.image
-ORIG_TEXT = bytes(IMG[:MOD.text_end])   # the text as the file has it, before any cut or site: <name>.changed.tsv compares against it
 if not FAR: IMG.extend(bytes(bss))
 TEXT_END = MOD.text_end
 RO_OFF, DATA_OFF = MOD.segments[1][0], MOD.segments[2][0]
@@ -576,27 +569,7 @@ def x18_words(lo, hi):
             if R18.search(op): out.add(addr)
         a = last + 4 if last + 4 >= end else last + 8   # the chunk is done, or the word after the last decoded one is no instruction
     return out
-# The x18 scan and the spin wait search only read the original image, so they can run in worker processes.
-def in_parallel(fn, jobs):
-    """Returns [fn(*job) for job in jobs], computed in forked worker processes.
-    The workers are forked on each call, so they see the module's state as it is at that point."""
-    if WORKERS < 2 or len(jobs) < 2:
-        return [fn(*job) for job in jobs]
-    with multiprocessing.get_context('fork').Pool(min(WORKERS, len(jobs))) as pool:
-        return pool.starmap(fn, jobs)
-
-def find_x18_words():
-    """x18_words over all the code, in 1 MB pieces"""
-    pieces = []
-    for start, end in CODE_RANGES:
-        for lo in range(start, end, 0x100000):
-            pieces.append((lo, min(lo + 0x100000, end)))
-    words = set()
-    for found in in_parallel(x18_words, pieces):
-        words |= found
-    return words
-
-x18 = find_x18_words()
+x18 = set().union(*(x18_words(s, e) for s, e in CODE_RANGES))
 kinds = {}
 # Spin wait candidates (see "Spin waits" below): backward direct branches (b, b.cond, cbz / cbnz, tbz / tbnz) at most SPIN_WIN bytes back, by target
 SPIN_WIN, SPIN_TOPS = 512, {0x16, 0x17, 0x54, 0x34, 0x35, 0xB4, 0xB5, 0x36, 0x37, 0xB6, 0xB7}
@@ -890,7 +863,8 @@ def jump_adr_offsets(insl, j):
             if m and m.group(1) in idx: idx.add(m.group(2)); continue
             m = re.fullmatch(r'(w\d+), #(0x[0-9a-f]+|\d+)', p.op_str) if p.mnemonic == 'cmp' else None
             if m and m.group(1) in idx: cmp = p; break
-            if any('w' + p.reg_name(r)[1:] in idx for r in p.regs_access()[1]): return None   # the index changes after the check
+            # the index changes after the check; only general registers count (Mario Kart World 1.0.0 main+0xea494 loads s1 between cmp w1,#5 and the ldrsw that w1 indexes)
+            if any(p.reg_name(r)[0] in 'wx' and 'w' + p.reg_name(r)[1:] in idx for r in p.regs_access()[1]): return None
         if cmp is None: return None
         n, at = int(cmp.op_str.split('#')[1], 0) + 1, wa.operands[1].imm
         def targets(tb): return [at + struct.unpack_from('<i', IMG, tb + 4 * i)[0] for i in range(n)] if 0 <= tb and tb + 4 * n <= len(IMG) else None
@@ -1250,7 +1224,6 @@ if UE_CALL is not None:
     region_obs.append((UE_CALL, OBS_UE_MALLOC, f'{NOP:08x}', 'FMallocBinned3 constructor call (cut): the object in x0; the host puts its allocator\'s vtable in (hle_uemalloc.c)'))
 # Unreal's engine region (above): the gate on the store of its size, which the callback changes in that register and x1, the size the call asks for
 if UE_REGION is not None:
-    assert UE_REGION_REG is not None, 'engine region gate has no size register'
     assert UE_REGION not in kinds and not any(lo <= UE_REGION < hi for wseg in windows for lo, hi in [(wseg[0].address, wseg[-1].address + 4)]), f'engine region gate conflicts with a rewrite site {UE_REGION:#x}'
     region_obs.append((UE_REGION, OBS_UE_REGION | UE_REGION_REG << 8, f'{struct.unpack_from("<I", IMG, UE_REGION)[0]:08x}',
                        f'Unreal\'s engine region: its size in x{UE_REGION_REG}, stored before nninitStartup reserves it; the host gives what the alias region has room for (hle_svc.c)'))
@@ -1573,22 +1546,7 @@ def spin_emit(g):
         if x.mnemonic == 'b': put_branch(b, cpy[T])
         else: st = here(); emit(spin_rebranch(x, here(), cpy[T])); emit(B(here(), b + 4)); put_branch(b, st)
     stat('spin')
-spin_heads = sorted(spin_cand)
-
-def spin_heads_with_region(first, step):
-    return [T for T in spin_heads[first::step] if spin_region(T, spin_cand[T])]
-
-def find_spin_regions():
-    """spin_region for every candidate head that has one, in address order. Each job takes every nth head, so the slow stretches
-    of code are spread across the workers. A region holds capstone objects, which can't be sent back from a worker, so the workers
-    only say which heads have one and the regions are built again here."""
-    step = min(8 * WORKERS, len(spin_heads))
-    heads = []
-    for found in in_parallel(spin_heads_with_region, [(first, step) for first in range(step)]):
-        heads += found
-    return [spin_region(T, spin_cand[T]) for T in sorted(heads)]
-
-spin_regions = find_spin_regions()   # all found on the unchanged image first: emitting patches back-edges
+spin_regions = [g for g in (spin_region(T, spin_cand[T]) for T in sorted(spin_cand)) if g]   # all found on the unchanged image first: emitting patches back-edges
 spin_sites = [(g['T'], sorted(g['valid']), sum(len(g['nodes'][a]['ins']) for a in g['R'])) for g in spin_regions]
 for g in spin_regions: spin_emit(g)
 if os.environ.get('DM_SPIN_LIST'):
@@ -1640,28 +1598,6 @@ with open(P('sites.tsv'), 'w') as f:
 with open(P('cuts.tsv'), 'w') as f:
     f.write(f'# BUILD_ID\t{BUILD_ID}\n')
     for off, ob, nb, why in cuts: f.write(f'{off:#x}\t{ob}\t{nb}\t{why}\n')   # Columns: offset, original bytes, new bytes, reason
-# The text words whose instructions no longer run as the file has them: every word this rewriter changed (sites, cuts, lock
-# acquires, jump tables), the windows whose copies in the patch area run instead, and the spin waits' instructions, which run
-# from their copies after the first pass. Runs of offset and length; the host's cheat engine refuses a write into any of them
-# (hle_cheats.c main_write_pages: a cheat's instruction there would undo a site or never run)
-def changed_runs():
-    words = set()
-    for o in range(0, TEXT_END, 0x1000):   # whole blocks first: almost all of the text is unchanged
-        if IMG[o:o + 0x1000] != ORIG_TEXT[o:o + 0x1000]:
-            words.update(w for w in range(o, min(o + 0x1000, TEXT_END), 4) if IMG[w:w + 4] != ORIG_TEXT[w:w + 4])
-    for wseg in windows: words.update(range(wseg[0].address, wseg[-1].address + 4, 4))
-    for g in spin_regions:
-        for a in g['R']:
-            n = g['nodes'][a]; pre = n.get('pre', 0)
-            words.update(a + 4 * (i - pre) for i in range(len(n['ins'])))
-    runs = []
-    for w in sorted(words):
-        if runs and runs[-1][0] + runs[-1][1] == w: runs[-1][1] += 4
-        else: runs.append([w, 4])
-    return runs
-with open(P('changed.tsv'), 'w') as f:
-    f.write(f'# BUILD_ID\t{BUILD_ID}\n')
-    for off, n in changed_runs(): f.write(f'{off:#x}\t{n:#x}\n')   # Columns: offset, length in bytes
 with open(P('obs.tsv'), 'w') as f:
     f.write(f'# BUILD_ID\t{BUILD_ID}\n')
     for off, oid, ow, why in obs: f.write(f'{off:#x}\t{oid}\t{ow}\t{why}\n')

@@ -25,6 +25,8 @@ void guest_thread_init(void) {
     pthread_setspecific(g_keytls, own[0]); pthread_setspecific(g_keytlr, tlr);
     void **prev = pthread_getspecific(g_keyown); if (prev) own_free(prev);   // re-initialised on the same thread: free the previous set first (the new one is what the slots now point to)
     pthread_setspecific(g_keyown, own);
+    // DM_FPCR=<hex>: float control register every guest thread starts with (test switch; the Mac default is 0, Mario Kart World sets flush-to-zero 0x1000000 on its start-up thread itself)
+    { static long v = -2; if (v == -2) { const char *e = getenv("DM_FPCR"); v = e ? strtol(e, NULL, 16) : -1; } if (v >= 0) { uint64_t f = (uint64_t)v; __asm__ volatile("msr fpcr, %0" :: "r"(f)); } }
 }
 // The thread's kernel ID at TLR[0x110], the one svcGetThreadId answers (hle_thread.c's thr_t id, never 0: 0 is the owner word of an unlocked mutex). Without it every
 // unlocked SDK 22 mutex reads as the caller's and the first heap lock aborts (docs/reference/threads.md)

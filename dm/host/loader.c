@@ -134,11 +134,27 @@ int dm_sdk_major(void) {
     for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "sdk")) {
         const char *b = (const char *)g_mod[i].base + g_mod[i].ro_off, *e = (const char *)g_mod[i].base + g_mod[i].key_page_off;   // read-only data, data and bss
         for (const char *p = b; (p = memmem(p, (size_t)(e - p), "_nnSdk-", 7)); p += 7)
-            if (p - b >= 11 && !strncasecmp(p - 11, "NintendoSDK", 11) && p[7] >= '0' && p[7] <= '9') {
-                major = atoi(p + 7); LOG("sdk: NintendoSDK nnSdk-%.12s (major %d)", p + 7, major); break; }
+            if (p - b >= 11 && !strncasecmp(p - 11, "NintendoSDK", 11)) {
+                const char *v = p + 7; if (!strncmp(v, "Generic_", 8)) v += 8;   // Switch 2 SDKs: NintendoSdk_nnSdk-Generic_21_4_0
+                if (*v < '0' || *v > '9') continue;
+                major = atoi(v); LOG("sdk: NintendoSDK nnSdk-%.12s (major %d)", v, major); break; }
     }
     if (!major) LOG("[RED] sdk: no SDK version string in the sdk module; SDK-dependent behaviour takes the newer SDKs' side");
     return major;
+}
+
+// Whether the sdk module was built for the Switch 2 ("Ounce"): its file system access log line names the build spec ("FS_ACCESS: { sdk_version: 19.3.3, spec: Ounce }";
+// Switch 1 SDKs say "spec: NX"). From upstream nxnative c4b0618c
+int dm_sdk_ounce(void) {
+    static int ounce = -1;
+    if (ounce >= 0) return ounce;
+    ounce = 0;
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "sdk")) {
+        const char *b = (const char *)g_mod[i].base + g_mod[i].ro_off, *e = (const char *)g_mod[i].base + g_mod[i].key_page_off;
+        if (memmem(b, (size_t)(e - b), "spec: Ounce", 11)) ounce = 1;
+    }
+    if (ounce) LOG("sdk: built for the Switch 2 (spec: Ounce)");
+    return ounce;
 }
 
 // Cross-module symbol resolution: first look for a definition in the loaded modules, and only if not found hand over to HLE / stubs
@@ -615,11 +631,7 @@ static void map_image(module_t *m, const char *dir) {
 }
 #endif
 
-static char g_module_dir[1024];   // the folder the modules were loaded from (dm_module_dir)
-const char *dm_module_dir(void) { return g_module_dir; }
-
 void load_modules(const char *dir, const char **names, int n) {
-    strlcpy(g_module_dir, dir, sizeof g_module_dir);
     // Map everything and parse the symbol tables first, then relocate all at once (cross-module symbols must all be in place first)
     // DM_BOOTPROF: breakdown of ① host loading (milliseconds), to set the upper bound for ③ pre-relocation / mmap
     uint64_t t0 = now_ns(), tm = 0, tp = 0, tg = 0, tr = 0, t;

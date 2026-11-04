@@ -103,6 +103,12 @@ void dm_fault_hook_register(int (*fn)(void *addr, int is_write, void *uc)) {
     if (g_nfault_hook >= MAX_FAULT_HOOK) die("too many page fault hooks");
     g_fault_hook[g_nfault_hook++] = fn;
 }
+// A hook that must see its own pages before the others (DM_GPU_READWATCH: the dirty-page hook claims every fault on a page it ever tracked and retries it as already writable)
+void dm_fault_hook_register_first(int (*fn)(void *addr, int is_write, void *uc)) {
+    if (g_nfault_hook >= MAX_FAULT_HOOK) die("too many page fault hooks");
+    for (int i = g_nfault_hook++; i > 0; i--) g_fault_hook[i] = g_fault_hook[i - 1];
+    g_fault_hook[0] = fn;
+}
 static void (*g_res_report)(uint32_t tick, const char *why);   // Resource count callback (registered by the graphics layer, called by diag.c per tick / event)
 void dm_res_report_register(void (*fn)(uint32_t tick, const char *why)) { g_res_report = fn; }
 void (*dm_res_report_cb(void))(uint32_t, const char *) { return g_res_report; }

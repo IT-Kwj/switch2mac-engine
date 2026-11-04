@@ -1,0 +1,13 @@
+# kind: evidence  Switch 2 mesh shader → the pixel shader it draws with (one each in every run: logs of "Switch 2 mesh pipeline"); nx2_split.py takes the per-primitive outputs from its flat inputs
+10bfb4e32ae8c05b	7104fedf8c9d9d96
+1585faea431dbac0	bf2db28e0007f27d
+194eada33c420ba8	30c4057b5a178167
+19c2c38964f561f8	7104fedf8c9d9d96
+2efbb2a9fa21219c	ae62ba75b82badc8
+3ab4eff510cfd8a1	7104fedf8c9d9d96
+625c3cd7510178a5	7104fedf8c9d9d96
+9d4c3fc29fce0690	fec8ca2d85686848
+b9edd9c570bd32dd	40224f1ca1176e55
+bdd0256e66c69a11	31de3e7aa83a0711
+d5a3c76ad87c427a	286d21df3059403a
+f5007af79bb5df3d	7104fedf8c9d9d96

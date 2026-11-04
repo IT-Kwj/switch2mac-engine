@@ -218,9 +218,12 @@ static void *ctl_main(void *arg) {
                 off += (long)n; line[--n] = 0; if (n && line[n - 1] == '\r') line[--n] = 0;
                 if (!n || line[0] == '#') continue;
                 if (!strcmp(line, "dump")) { crash_dump_now("DM_CTL dump"); continue; }
+                if (!strncmp(line, "burst ", 6)) { void dm_gfx_shot_burst(long n, const char *dir); char *e2; long n = strtol(line + 6, &e2, 10); while (*e2 == ' ') e2++; dm_gfx_shot_burst(n, e2); continue; }
                 if (!strncmp(line, "shot ", 5)) { dm_gfx_shot_at(1, line + 5); LOG("DM_CTL: screenshot of the next frame → %s", line + 5); continue; }
                 if (!strncmp(line, "texlist ", 8)) { void dm_gfx_texlist(int target); dm_gfx_texlist(atoi(line + 8)); continue; }
                 if (!strncmp(line, "texraw ", 7)) { void dm_gfx_texraw(uint64_t serial, const char *path); char *e2; uint64_t s = strtoull(line + 7, &e2, 10); while (*e2 == ' ') e2++; dm_gfx_texraw(s, e2); continue; }
+                if (!strncmp(line, "probewin ", 9)) { void dm_probe_window(uint64_t n); dm_probe_window(strtoull(line + 9, NULL, 0)); continue; }
+                if (!strncmp(line, "readwatch ", 10)) { void dm_gfx_readwatch(uint64_t a, uint64_t n); char *e2; uint64_t a = strtoull(line + 10, &e2, 16); dm_gfx_readwatch(a, strtoull(e2, NULL, 0)); continue; }
                 if (!strncmp(line, "peek ", 5)) { void dm_ctl_peek(uint64_t a, int n); char *e2; uint64_t a = strtoull(line + 5, &e2, 16); dm_ctl_peek(a, (int)strtol(e2, NULL, 0)); continue; }
                 if (!strncmp(line, "memdump ", 8)) { void dm_ctl_memdump(uint64_t a, uint64_t n, const char *path); char *e2, *e3; uint64_t a = strtoull(line + 8, &e2, 16), n = strtoull(e2, &e3, 0);
                                                      while (*e3 == ' ') e3++; dm_ctl_memdump(a, n, e3); continue; }
@@ -440,31 +443,6 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
     if (s->ry < -STICK_THRESH) b |= 1u << 23;
     s->buttons = b;
     s->attributes = ATTR_CONNECTED | (id == NPAD_HANDHELD ? ATTR_WIRED | ATTR_LEFT_CONN | ATTR_LEFT_WIRED | ATTR_RIGHT_CONN | ATTR_RIGHT_WIRED : ATTR_LEFT_CONN | ATTR_RIGHT_CONN);
-}
-// The cheat VM's key mask (hle_cheats.c "all keys of the mask held"): the OR of every player's controller buttons
-// (the keyboard / touch source's bits included) plus the eight stick-direction pseudo buttons of the merged axes —
-// one flat bitset, not exactly any one npad read (fill() publishes per-npad states with attributes, merges and
-// latches), and nothing here consumes a latch or bumps the sampling: the game's own reads keep them both. Mask bits:
-// the buttons 0..15 in NpadButton order and the sticks' directions 16..23; SL / SR (bits 24 / 25) can never fire, no
-// input source of this host reports them
-uint64_t dm_cheats_keys(void) {
-    uint64_t b = 0; int32_t a[4] = {0};
-    b |= atomic_load(&g_btn);
-    for (int p = 0; p < DM_PLAYERS; p++) {
-        b |= atomic_load(&g_pad_btn[p]);
-        uint64_t v = atomic_load(&g_pad_axes[p]); for (int i = 0; i < 4; i++) a[i] = pick(a[i], ax(v, i));
-    }
-    uint64_t k = atomic_load(&g_axes); for (int i = 0; i < 4; i++) a[i] = pick(a[i], ax(k, i));
-    b &= 0xffffull;
-    if (a[0] < -STICK_THRESH) b |= 1u << 16;
-    if (a[1] > STICK_THRESH) b |= 1u << 17;
-    if (a[0] > STICK_THRESH) b |= 1u << 18;
-    if (a[1] < -STICK_THRESH) b |= 1u << 19;
-    if (a[2] < -STICK_THRESH) b |= 1u << 20;
-    if (a[3] > STICK_THRESH) b |= 1u << 21;
-    if (a[2] > STICK_THRESH) b |= 1u << 22;
-    if (a[3] < -STICK_THRESH) b |= 1u << 23;
-    return b;
 }
 // GetNpadStates(out, n, id): newest first, n entries: the current state repeated with consecutive sampling numbers. The host keeps no history, but on hardware the
 // 16-entry history is always full, and games read all of it whatever count comes back: Super Mario Odyssey (main+0x93fc20) polls every controller slot each frame, which advances

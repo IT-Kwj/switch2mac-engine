@@ -16,6 +16,8 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
         private const uint SpirvVersionMinor = 3;
         private const uint SpirvVersionRevision = 0;
         private const uint SpirvVersionPacked = (SpirvVersionMajor << 16) | (SpirvVersionMinor << 8) | SpirvVersionRevision;
+        // nxnative: SPV_EXT_mesh_shader needs SPIR-V 1.4 (whose entry points list every global variable they use: SpirvGenerator.GenerateMeshEntry)
+        private const uint MeshSpirvVersion = (1 << 16) | (4 << 8);
 
         public StructuredProgramInfo Info { get; }
 
@@ -42,6 +44,12 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
         public Dictionary<IoDefinition, Instruction> OutputsPerPatch { get; } = new();
 
         public StructuredFunction CurrentFunction { get; set; }
+
+        // nxnative: a Switch 2 mesh program's per-vertex / per-primitive stores (MeshShaderInfo window 4) go through this function (word, value) straight into the mesh outputs; its body is
+        // written by SpirvGenerator.GenerateMeshEntry
+        private Instruction _meshPlaneStore;
+        public Instruction MeshPlaneStore => _meshPlaneStore ??= Function(TypeVoid(), Spv.Specification.FunctionControlMask.MaskNone, TypeFunction(TypeVoid(), false, TypeU32(), TypeU32()));
+        public bool HasMeshPlaneStore => _meshPlaneStore != null;
         private readonly Dictionary<AstOperand, Instruction> _locals = new();
         private readonly Dictionary<int, Instruction> _funcArgs = new();
         private readonly Dictionary<int, (StructuredFunction, Instruction)> _functions = new();
@@ -88,7 +96,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             StructuredProgramInfo info,
             CodeGenParameters parameters,
             GeneratorPool<Instruction> instPool,
-            GeneratorPool<LiteralInteger> integerPool) : base(SpirvVersionPacked, instPool, integerPool)
+            GeneratorPool<LiteralInteger> integerPool) : base(parameters.Properties.Mesh != null ? MeshSpirvVersion : SpirvVersionPacked, instPool, integerPool)
         {
             WasNonUniformAccessDeclared = false;
 

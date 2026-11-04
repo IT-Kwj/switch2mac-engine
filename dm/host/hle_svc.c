@@ -22,14 +22,6 @@ static size_t g_reserve;           // its size: RESERVE, or more with a DM_ALIAS
 static uint8_t *g_heap; static _Atomic size_t g_heap_cur; static size_t g_heap_cap;
 // The address range lies entirely within the currently opened (readable and writable) part of the guest heap: such reads need no kernel trap to check, memcpy directly (used where guest memory is read every tick, such as diag.c tk_rd)
 int dm_guest_heap_readable(uint64_t a, size_t n) { uint64_t b = (uint64_t)(uintptr_t)g_heap; size_t cur = g_heap_cur; return g_heap && a >= b && n <= cur && a - b <= cur - n; }
-// The opened heap span for callers that address guest memory by region (hle_cheats.c region 1, like dmnt's heap extents): the
-// reservation's base (guest address) and the length the game has actually opened with SetHeapSize right now, which grows and
-// shrinks with it; both 0 until the game's first SetHeapSize. There is no lock: the caller uses the pair only to bounds-check and
-// restarts the check on each access, so a concurrent resize can at worst give it an answer about the span a moment ago
-void dm_guest_heap_range(uint64_t *base, size_t *open_len) {
-    if (base) *base = (uint64_t)(uintptr_t)g_heap;
-    if (open_len) *open_len = g_heap ? atomic_load(&g_heap_cur) : 0;
-}
 static uint8_t *g_alias; static size_t g_alias_cap;
 static _Atomic uint64_t *g_alias_bits;   // alias region page bitmap (alias_pages)
 static uint64_t *g_alias_exposed;   // one bit per host page ever opened; protected by g_map_lock
@@ -93,7 +85,8 @@ void svc_guest_range(uint8_t **base, size_t *size) { *base = g_as; *size = g_res
 enum { I_CoreMask=0, I_PriorityMask=1, I_AliasAddr=2, I_AliasSize=3, I_HeapAddr=4, I_HeapSize=5,
        I_TotalMem=6, I_UsedMem=7, I_DebuggerAttached=8, I_ResourceLimit=9, I_IdleTick=10, I_RandomEntropy=11,
        I_AslrAddr=12, I_AslrSize=13, I_StackAddr=14, I_StackSize=15, I_SysResTotal=16, I_SysResUsed=17,
-       I_ProgramId=18, I_InitProcIdRange=19, I_UserExcAddr=20, I_TotalNonSys=21, I_UsedNonSys=22, I_IsApplication=23, I_FreeThreadCount=24 };
+       I_ProgramId=18, I_InitProcIdRange=19, I_UserExcAddr=20, I_TotalNonSys=21, I_UsedNonSys=22, I_IsApplication=23, I_FreeThreadCount=24,
+       I_Nx2RegionAddr=29, I_Nx2RegionSize=30, I_Nx2RemoteSize=31, I_Nx2RemoteUsed=32, I_Nx2Granule=33 };
 
 static uint8_t g_seen[256];
 
@@ -106,24 +99,6 @@ static uint8_t g_seen[256];
 static struct { uint64_t base, size, src; uint32_t state; } g_map[MAX_MAP];
 static int g_nmap;
 static pthread_mutex_t g_map_lock = PTHREAD_MUTEX_INITIALIZER;
-// A hole-free read / write of guest heap bytes for the cheat VM (hle_cheats.c): under g_map_lock no concurrent SetHeapSize
-// can mprotect the span away between the bounds check and the copy (both hold this same lock), so a live heap address cannot
-// turn into a fault while the cheat VM touches it. Both return 0 when every byte was inside the currently opened (readable
-// and writable) span, 1 otherwise. The address is the guest heap address the cheat VM computed (heap base + rel + offset register)
-int dm_guest_heap_write(uint64_t addr, const void *src, size_t len) {
-    pthread_mutex_lock(&g_map_lock);
-    int out = !dm_guest_heap_readable(addr, len);
-    if (!out) { dm_guest_write_prepare((void *)(uintptr_t)addr, len); memcpy((void *)(uintptr_t)addr, src, len); }
-    pthread_mutex_unlock(&g_map_lock);
-    return out;
-}
-int dm_guest_heap_read(uint64_t addr, void *out, size_t len) {
-    pthread_mutex_lock(&g_map_lock);
-    int bad = !dm_guest_heap_readable(addr, len);
-    if (!bad) memcpy(out, (void *)(uintptr_t)addr, len);
-    pthread_mutex_unlock(&g_map_lock);
-    return bad;
-}
 static int map_find(uint64_t a, uint64_t n) {       // returns a 1-based index, 0 = no overlap; caller holds g_map_lock
     for (int i = 0; i < g_nmap; i++) if (a < g_map[i].base + g_map[i].size && g_map[i].base < a + n) return i + 1;
     return 0;
@@ -654,7 +629,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         if (regs[0] & 0x80000000ull) return 0;   // notification only, can continue
         _exit(42);
     }
-    case 0x1E: guest_clock_read_wait(); regs[0] = 0; regs[1] = guest_ns() * 12 / 625; return 0;   // GetSystemTick
+    case 0x1E: guest_clock_read_wait(); regs[0] = 0; regs[1] = guest_ticks(); return 0;   // GetSystemTick
     case 0x27: {  // OutputDebugString(str, len)
         if (g_flag.dbg) fprintf(stderr, "[guest] %.*s\n", (int)regs[1], (char *)regs[0]);
         regs[0] = 0; return 0;
@@ -685,6 +660,11 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         // 96 threads (pm_spec.cpp BaseApplicationThreads; a boost raises it to 256). Monster Train 2's Unity 2022.3 player creates a thread only when this is at least 1: the 0 it got here
         // left its main thread waiting at boot for a thread it never created (main+0x3e1ac4)
         case I_FreeThreadCount: { int thr_limit_used(void); int u = thr_limit_used(); v = u < 96 ? 96 - u : 0; break; }
+        // Switch 2 ids. 29/30: the region VAMM reserves in, backed with MapPhysicalMemory, so the alias region's upper half (a guess, open: the console's real layout).
+        // 31/32: remote memory for the graphics servers, which do not run here. 33: VAMM's page granule; 0 makes it map a size of 0 and abort with 0xD401
+        case I_Nx2RegionAddr: v = (uint64_t)g_alias + g_alias_cap / 2; break;   case I_Nx2RegionSize: v = g_alias_cap / 2; break;
+        case I_Nx2RemoteSize: case I_Nx2RemoteUsed: v = 0; break;
+        case I_Nx2Granule: v = 0x1000; break;
         case I_UserExcAddr: { static _Alignas(0x1000) uint8_t ctx[0x1000]; v = (uint64_t)ctx; break; }   // user exception context area: newer SDKs' SetDyingMessageRegion writes to +0x1c0 (0 would write through a null pointer)
         default: v = 0; break;
         }

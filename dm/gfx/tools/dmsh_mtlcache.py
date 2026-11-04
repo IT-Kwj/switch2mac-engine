@@ -26,6 +26,8 @@ def compiler_id(sdk):
     return re.sub(r'(?m)^InstalledDir:.*\n?', '', tools) + run('--show-sdk-version') + run('--show-sdk-build-version')   # the install path changes with each toolchain mount
 
 
+PRE = None   # optional str → str rewrite of every source before it is compiled (set by dmsh_build.py)
+
 class Cache:
     def __init__(self, root, targets, work):
         """targets: {name: (sdk, record, compile)}, compile(msl, air, lib) as ios_metal.compile; work: a folder for temporary .air files"""
@@ -51,13 +53,20 @@ class Cache:
 
     def compile(self, target, msl, lib):
         """msl → lib for target: a clone of the library that the same source compiled to before, or a compile (then kept). Raises CalledProcessError as the compile does"""
-        p = self.path(target, open(msl, 'rb').read())
+        src = open(msl, 'rb').read()
+        if PRE:   # a last rewrite of the text compiled (dmsh_build.py cb_hoist), keyed by the text actually compiled
+            t = PRE(src.decode()).encode()
+            if t != src: msl = f'{msl}.pre-{os.getpid()}-{threading.get_ident()}.metal'; open(msl, 'wb').write(t); src = t
+        p = self.path(target, src)
         if os.path.exists(p):
-            clone(p, lib); self.count((target, 'reused')); return
+            clone(p, lib); self.count((target, 'reused'))
+            if '.pre-' in msl: os.unlink(msl)
+            return
         tmp = f'{lib}.tmp-{os.getpid()}-{threading.get_ident()}'
         self._compile(target, msl, tmp)
         os.replace(tmp, lib)
         os.makedirs(os.path.dirname(p), exist_ok=True); clone(lib, p); self.count((target, 'compiled'))
+        if '.pre-' in msl: os.unlink(msl)
 
     def _check(self, target, d, stems, mac_dir):
         """None if folder d was built with the current convention and compiler, else why not"""

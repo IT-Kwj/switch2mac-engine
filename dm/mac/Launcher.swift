@@ -14,61 +14,76 @@ struct LauncherView: View {
     let done: (Bool) -> Void
     let fit: (CGFloat) -> Void
     @AppStorage("window.show") private var show = true
-    @AppStorage("window.advanced") private var advanced = false
+    @AppStorage("window.tab") private var tab = ""
+
+    static let accent = Color(red: 80 / 255, green: 1, blue: 120 / 255)
+    static let card = Color(white: 1, opacity: 0.06), line = Color(white: 1, opacity: 0.12)
+    private var tabs: [String] { m.sections + ["Saves"] }
+    private func tabTitle(_ t: String) -> String { t == "Game" ? "Display" : t }
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 12) {
-                Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 64, height: 64).accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(info("CFBundleName") ?? "Game").font(.title2.weight(.semibold))
-                    Text("Version \(info("CFBundleShortVersionString") ?? "1.0")").foregroundStyle(.secondary)
+            HStack(spacing: 14) {
+                Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 56, height: 56).clipShape(RoundedRectangle(cornerRadius: 12)).accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(info("CFBundleName") ?? "Game").font(.system(size: 22, weight: .bold))
+                    Text("Version \(info("CFBundleShortVersionString") ?? "1.0") · native Mac build").font(.system(size: 12, weight: .medium, design: .monospaced)).foregroundStyle(Self.accent)
                 }
                 Spacer()
             }
-            .padding([.horizontal, .top], 20)
-            Form {
-                settingSections(basic: true)
-                CloudSavesSection()
-                Section {
-                    DisclosureGroup("Advanced settings", isExpanded: $advanced) {}
+            .padding(.horizontal, 22).padding(.top, 34).padding(.bottom, 14)
+            HStack(spacing: 6) {
+                ForEach(tabs, id: \.self) { t in
+                    let on = t == current
+                    Button { tab = t } label: {
+                        Text(tabTitle(t)).font(.system(size: 13, weight: .semibold)).padding(.horizontal, 14).padding(.vertical, 6)
+                            .foregroundStyle(on ? Color.black : Color.white.opacity(0.8))
+                            .background(Capsule().fill(on ? Self.accent : Self.card))
+                            .overlay(Capsule().stroke(on ? Color.clear : Self.line))
+                    }.buttonStyle(.plain)
                 }
-                if advanced {
-                    settingSections(basic: false)
-                    Section {
-                        Button("Reset to tested defaults") { m.reset() }
-                            .disabled(!m.changed)
-                    } footer: {
-                        Text("Brings back all settings this game was tested with.")
+                Spacer()
+            }
+            .padding(.horizontal, 22).padding(.bottom, 12)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    if current == "Saves" { card { CloudSavesSection() } }
+                    else {
+                        ForEach(m.rows(in: current, basic: true)) { r in card { SettingRow(s: r, m: m) } }
+                        let adv = m.rows(in: current, basic: false)
+                        if !adv.isEmpty {
+                            Text("ADVANCED").font(.system(size: 11, weight: .bold, design: .monospaced)).foregroundStyle(.secondary).padding(.top, 8).padding(.leading, 4)
+                            ForEach(adv) { r in card { SettingRow(s: r, m: m) } }
+                        }
                     }
                 }
+                .padding(.horizontal, 22).padding(.bottom, 12)
             }
-            .formStyle(.grouped)
-            .onScrollGeometryChange(for: CGFloat.self) {
-                $0.contentSize.height + $0.contentInsets.top + $0.contentInsets.bottom - $0.containerSize.height
-            } action: { _, extraHeight in
-                fit(extraHeight)
-            }
-            HStack {
-                Toggle("Show this window at launch", isOn: $show).toggleStyle(.checkbox)
+            Divider().overlay(Self.line)
+            HStack(spacing: 10) {
+                Toggle("Show this window at launch", isOn: $show).toggleStyle(.checkbox).font(.system(size: 12))
                 Spacer()
+                Button("Reset") { m.reset() }.disabled(!m.changed)
                 Button("Quit") { done(false) }
-                Button("Play") { done(true) }.keyboardShortcut(.defaultAction)
+                Button { done(true) } label: {
+                    Text("Play").font(.system(size: 14, weight: .bold)).foregroundStyle(.black).padding(.horizontal, 22).padding(.vertical, 6)
+                        .background(Capsule().fill(Self.accent))
+                }.buttonStyle(.plain).keyboardShortcut(.defaultAction)
             }
-            .padding(20)
+            .padding(.horizontal, 22).padding(.vertical, 14)
         }
-        .frame(minWidth: 520, idealWidth: 560)
+        .tint(Self.accent)
+        .background(LinearGradient(colors: [Color(white: 0.10), Color(white: 0.05)], startPoint: .top, endPoint: .bottom))
+        .preferredColorScheme(.dark)
+        .frame(minWidth: 560, idealWidth: 600, minHeight: 520)
     }
 
-    @ViewBuilder private func settingSections(basic: Bool) -> some View {
-        ForEach(m.sections(basic: basic), id: \.self) { section in
-            let rows = m.rows(in: section, basic: basic)
-            if !rows.isEmpty {
-                Section(section) {
-                    ForEach(rows) { SettingRow(s: $0, m: m) }
-                }
-            }
-        }
+    private var current: String { tabs.contains(tab) ? tab : (tabs.first ?? "Saves") }
+
+    private func card<C: View>(@ViewBuilder _ c: () -> C) -> some View {
+        c().padding(.horizontal, 14).padding(.vertical, 11).frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 10).fill(Self.card))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Self.line))
     }
 }
 
@@ -83,7 +98,7 @@ struct CloudSavesSection: View {
     }()
 
     var body: some View {
-        Section {
+        VStack(alignment: .leading, spacing: 8) {
             LabeledContent("Cloud saves") {
                 Text(fixed.map { "\(Self.shown($0)) (env.txt)" } ?? (folder.isEmpty ? "Off" : Self.shown(folder)))
                     .foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
@@ -94,8 +109,8 @@ struct CloudSavesSection: View {
                     if !folder.isEmpty { Button("Turn off") { folder = "" } }
                 }
             }
-        } footer: {
-            Text("Choose the iCloud Drive folder the iPhone app uses for this game. The save comes in when the game starts and goes out after each save; a save that is replaced is kept in the save's -backups folder.")
+            Text("Optional: a folder (iCloud Drive) the save is synced through. The save comes in when the game starts and goes out after each save; a save that is replaced is kept in the save's -backups folder.")
+                .font(.footnote).foregroundStyle(.secondary)
         }
     }
 
@@ -130,9 +145,10 @@ private final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate 
         app.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         app.addItem(withTitle: "Quit \(name)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.submenu = app; menu.addItem(item); NSApp.mainMenu = menu
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 660), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 600), styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
         w.title = name; w.isReleasedWhenClosed = false; w.delegate = self
-        w.contentMinSize = NSSize(width: 520, height: 0)
+        w.appearance = NSAppearance(named: .darkAqua); w.titlebarAppearsTransparent = true; w.titleVisibility = .hidden; w.isMovableByWindowBackground = true
+        w.contentMinSize = NSSize(width: 560, height: 520)
         window = w
         if let screen = w.screen ?? NSScreen.main {
             w.setFrameTopLeftPoint(NSPoint(x: screen.visibleFrame.midX - w.frame.width / 2, y: screen.visibleFrame.maxY))
@@ -184,6 +200,13 @@ public func dmMacLauncher() -> Int32 {
         return 2
     }
     let model = LauncherModel(file.settings)
+    // No window (Info.plist DMLauncherWindow false: the settings are in the game, key 2): every setting goes into the environment as Play would, saved choice or the list's default,
+    // so this build's own defaults (which can differ from the host's) apply too; launcher.c's saved choices alone set only the changed ones
+    if (Bundle.main.object(forInfoDictionaryKey: "DMLauncherWindow") as? Bool) == false && !NSEvent.modifierFlags.contains(.option) {
+        fputs("launcher: no settings window (settings are in the game; hold Option at launch to show it)\n", stderr)
+        model.apply()
+        return 1
+    }
     let app = NSApplication.shared, launcher = Launcher(model)
     app.setActivationPolicy(.regular)
     app.delegate = launcher
