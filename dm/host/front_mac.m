@@ -273,6 +273,14 @@ static double footprint_gb(void) { task_vm_info_data_t vi; mach_msg_type_number_
     if (_n < OV_N) _fps[_n++] = (float)_fpsNow; else { memmove(_fps, _fps + 1, (OV_N - 1) * sizeof *_fps); _fps[OV_N - 1] = (float)_fpsNow; }
     [self refreshWithCPU:cpuPct];
 }
+// The engine this app was built with (S2M_ENGINE, baked in by switch2mac.py: "switch2mac", or "nxnative-84dea6983541" for another engine's build):
+// its name, and the commit's first 8 characters when it has one. tools/engine/s2m_ui.m in switch2mac has the same for the other engines.
+static void engine_name(NSString **name, NSString **version) {
+    const char *e = getenv("S2M_ENGINE"); NSString *s = e && *e ? @(e) : @"";
+    NSRange dash = [s rangeOfString:@"-" options:NSBackwardsSearch]; NSString *tail = dash.location != NSNotFound ? [s substringFromIndex:dash.location + 1] : @"";
+    BOOL hex = tail.length >= 7 && [tail rangeOfCharacterFromSet:[[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdef"] invertedSet]].location == NSNotFound;
+    *name = hex ? [s substringToIndex:dash.location] : s; *version = hex ? [tail substringToIndex:MIN(8u, tail.length)] : @"";
+}
 - (void)refreshWithCPU:(double)cpuPct {
     self.hidden = g_ov_mode == 0; if (!g_ov_mode) return;
     NSFont *mono = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightMedium];
@@ -283,7 +291,13 @@ static double footprint_gb(void) { task_vm_info_data_t vi; mach_msg_type_number_
     void (^line)(NSString *, NSColor *) = ^(NSString *s, NSColor *c) { [a appendAttributedString:[[NSAttributedString alloc] initWithString:s attributes:@{NSFontAttributeName: mono, NSForegroundColorAttributeName: c}]]; };
     NSString *gpu = _gpu >= 0 ? [NSString stringWithFormat:@"%.1f ms", _gpu] : @"--";
     int gw0, gh0; nvn_game_size(&gw0, &gh0);
-    line([NSString stringWithFormat:@"FPS %.0f", _fpsNow], fc);
+    NSString *eng, *engVer; engine_name(&eng, &engVer);
+    NSString *fpsText = [NSString stringWithFormat:@"FPS %.0f", _fpsNow];
+    line(fpsText, fc);
+    if (eng.length) {   // the engine, dimmed, at the right of the FPS line (the font is monospaced: pad to the hint line's width)
+        NSInteger pad = MAX(2, 21 - (NSInteger)fpsText.length - (NSInteger)eng.length);
+        line([[@"" stringByPaddingToLength:pad withString:@" " startingAtIndex:0] stringByAppendingString:eng], [NSColor colorWithWhite:0.6 alpha:1]);
+    }
     line(gw0 > 0 ? [NSString stringWithFormat:@"\n%dx%d", gw0, gh0] : @"\n--", green);
     if (g_ov_mode == 2) {
         line([NSString stringWithFormat:@"\nGPU %@", gpu], _gpu > 16.7 ? yellow : green);
@@ -292,6 +306,7 @@ static double footprint_gb(void) { task_vm_info_data_t vi; mach_msg_type_number_
         double mem = footprint_gb(); line([NSString stringWithFormat:@"\nMemory %.1f GB", mem], mem > 16 ? yellow : green);
         line([NSString stringWithFormat:@"\nGame pacing %d fps", nvn_game_fps()], grey);
         NSSize px = g_layer.drawableSize; line([NSString stringWithFormat:@"\nOutput %.0fx%.0f", px.width, px.height], grey);
+        if (eng.length) line([NSString stringWithFormat:@"\nEngine %@%@%@", eng, engVer.length ? @" " : @"", engVer], grey);
     }
     line(g_ov_mode == 2 ? @"\n1: hide · 2: settings" : @"\n1: more · 2: settings", grey);
     self.label.attributedStringValue = a;
