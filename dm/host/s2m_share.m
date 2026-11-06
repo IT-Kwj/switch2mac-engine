@@ -4,7 +4,7 @@
 // and that were not sent before (.shader-list-contribution.txt.done) are written to shader-list-contribution.txt in the same folder, under a header naming the game's
 // title ID and its engine (S2M_ENGINE, baked into the app), so the game's list in the repository only ever takes rows from its own build.
 // Each time 100 new rows have built up (S2M_SHARE_EVERY), a dialog asks: Send opens the "Shader list" issue form (S2M_SHARE_REPO, default switch2mac's) and shows a copy
-// of the file in Finder to drag in, then marks its rows as sent; Remind me later asks again after 100 more; Stop reminding (s2m.share.never in the app's preferences)
+// of the file in Finder to drag in (shader-list-<title ID>-<date>.txt), then marks its rows as sent and removes the contribution file; Remind me later asks again after 100 more; Stop reminding (s2m.share.never in the app's preferences)
 // or S2M_SHARE=0 never asks. The app uploads nothing itself. Only rows of hex keys and numbers are read or written: no game data, no paths, no names.
 #import <Cocoa/Cocoa.h>
 #include "dm.h"
@@ -62,7 +62,7 @@ static void share_at_close(void) {
     NSString *out = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"shader-list-%@-%@.txt", tid, [df stringFromDate:NSDate.date]]];
     write_rows(out, head, rows);
     NSMutableArray *all = [list_rows(sent) mutableCopy]; [all addObjectsFromArray:rows]; write_rows(sent, @"", all);   // sent: never offered again
-    write_rows(contrib, head, @[]); [u setInteger:every forKey:@"s2m.share.next"];
+    [NSFileManager.defaultManager removeItemAtPath:contrib error:nil]; [u setInteger:every forKey:@"s2m.share.next"];   // sent: only the dated file stays, the one to drag in (an emptied contribution file beside it got attached instead, #23 #24)
     const char *rp = getenv("S2M_SHARE_REPO"); NSString *repo = rp && *rp ? @(rp) : @"https://github.com/azmasm/switch2mac";
     NSMutableCharacterSet *cs = [NSCharacterSet.URLQueryAllowedCharacterSet mutableCopy]; [cs removeCharactersInString:@"+&=?/#"];
     NSString *title = [NSString stringWithFormat:@"[Shader list] %@: %lu rows", game, (unsigned long)rows.count];
